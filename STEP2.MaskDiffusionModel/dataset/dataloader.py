@@ -1,0 +1,555 @@
+from monai.transforms import MapTransform
+from monai.utils.enums import PostFix
+from monai.data.image_reader import ImageReader
+from monai.utils import GridSamplePadMode, ensure_tuple, ensure_tuple_rep
+from monai.transforms.io.array import LoadImage, SaveImage
+from monai.config.type_definitions import NdarrayOrTensor
+from monai.utils.enums import TransformBackends
+from monai.transforms.transform import Transform, MapTransform
+from monai.config import DtypeLike, KeysCollection
+from monai.data import DataLoader, Dataset, list_data_collate, DistributedSampler, CacheDataset
+import pandas as pd
+from torch.utils.data import Subset
+from monai.transforms import (
+    AsDiscrete,
+    EnsureChannelFirstd,
+    Compose,
+    CropForegroundd,
+    LoadImaged,
+    Orientationd,
+    RandFlipd,
+    RandCropByPosNegLabeld,
+    RandShiftIntensityd,
+    ScaleIntensityRanged,
+    Spacingd,
+    RandRotate90d,
+    ToTensord,
+    CenterSpatialCropd,
+    Resized,
+    SpatialPadd,
+    apply_transform,
+    RandZoomd,
+    RandCropByLabelClassesd,
+)
+from monai.data import PersistentDataset
+import collections.abc
+import math
+import pickle
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import warnings
+from copy import copy, deepcopy
+import h5py
+import os
+
+
+import numpy as np
+import torch
+from typing import IO, TYPE_CHECKING, Any, Callable, Dict, Hashable, List, Mapping, Optional, Sequence, Tuple, Union
+
+sys.path.append("..")
+
+
+DEFAULT_POST_FIX = PostFix.meta()
+
+
+class UniformDataset(Dataset):
+    def __init__(self, data, transform, datasetkey):
+        super().__init__(data=data, transform=transform)
+        self.dataset_split(data, datasetkey)
+        self.datasetkey = datasetkey
+
+    def dataset_split(self, data, datasetkey):
+        self.data_dic = {}
+        for key in datasetkey:
+            self.data_dic[key] = []
+        for img in data:
+            key = get_key(img['name'])
+            self.data_dic[key].append(img)
+
+        self.datasetnum = []
+        for key, item in self.data_dic.items():
+            assert len(item) != 0, f'the dataset {key} has no data'
+            self.datasetnum.append(len(item))
+        self.datasetlen = len(datasetkey)
+
+    def _transform(self, set_key, data_index):
+        data_i = self.data_dic[set_key][data_index]
+        return apply_transform(self.transform, data_i) if self.transform is not None else data_i
+
+    def __getitem__(self, index):
+        # the index generated outside is only used to select the dataset
+        # the corresponding data in each dataset is selelcted by the np.random.randint function
+        set_index = index % self.datasetlen
+        set_key = self.datasetkey[set_index]
+        # data_index = int(index / self.__len__() * self.datasetnum[set_index])
+        data_index = np.random.randint(self.datasetnum[set_index], size=1)[0]
+        return self._transform(set_key, data_index)
+
+
+class UniformCacheDataset(PersistentDataset):
+    def __init__(self, data, transform, cache_rate, datasetkey):
+        super().__init__(data=data, transform=transform, cache_rate=cache_rate)
+        self.datasetkey = datasetkey
+        self.data_statis()
+
+    def data_statis(self):
+        data_num_dic = {}
+        for key in self.datasetkey:
+            data_num_dic[key] = 0
+        # breakpoint()
+        for img in self.data:
+            key = get_key(img['name'])
+            data_num_dic[key] += 1
+
+        self.data_num = []
+        for key, item in data_num_dic.items():
+            assert item != 0, f'the dataset {key} has no data'
+            self.data_num.append(item)
+
+        self.datasetlen = len(self.datasetkey)
+
+    def index_uniform(self, index):
+        # the index generated outside is only used to select the dataset
+        # the corresponding data in each dataset is selelcted by the np.random.randint function
+        set_index = index % self.datasetlen
+        data_index = np.random.randint(self.data_num[set_index], size=1)[0]
+        post_index = int(sum(self.data_num[:set_index]) + data_index)
+        return post_index
+
+    def __getitem__(self, index):
+        post_index = self.index_uniform(index)
+        # print(post_index, self.__len__())
+        return self._transform(post_index)
+
+
+class LoadImageh5d(MapTransform):
+    def __init__(
+        self,
+        keys: KeysCollection,
+        reader: Optional[Union[ImageReader, str]] = None,
+        dtype: DtypeLike = np.float32,
+        meta_keys: Optional[KeysCollection] = None,
+        meta_key_postfix: str = DEFAULT_POST_FIX,
+        overwriting: bool = False,
+        image_only: bool = False,
+        ensure_channel_first: bool = False,
+        simple_keys: bool = False,
+        allow_missing_keys: bool = False,
+        *args,
+        **kwargs,
+    ) -> None:
+        super().__init__(keys, allow_missing_keys)
+        self._loader = LoadImage(
+            reader, image_only, dtype, ensure_channel_first, simple_keys, *args, **kwargs)
+        if not isinstance(meta_key_postfix, str):
+            raise TypeError(
+                f"meta_key_postfix must be a str but is {type(meta_key_postfix).__name__}.")
+        self.meta_keys = ensure_tuple_rep(
+            None, len(self.keys)) if meta_keys is None else ensure_tuple(meta_keys)
+        if len(self.keys) != len(self.meta_keys):
+            raise ValueError("meta_keys should have the same length as keys.")
+        self.meta_key_postfix = ensure_tuple_rep(
+            meta_key_postfix, len(self.keys))
+        self.overwriting = overwriting
+
+    def register(self, reader: ImageReader):
+        self._loader.register(reader)
+
+    def __call__(self, data, reader: Optional[ImageReader] = None):
+        d = dict(data)
+        for key, meta_key, meta_key_postfix in self.key_iterator(d, self.meta_keys, self.meta_key_postfix):
+            data = self._loader(d[key], reader)
+            if self._loader.image_only:
+                d[key] = data
+            else:
+                if not isinstance(data, (tuple, list)):
+                    raise ValueError(
+                        "loader must return a tuple or list (because image_only=False was used).")
+                d[key] = data[0]
+                if not isinstance(data[1], dict):
+                    raise ValueError("metadata must be a dict.")
+                meta_key = meta_key or f"{key}_{meta_key_postfix}"
+                if meta_key in d and not self.overwriting:
+                    raise KeyError(
+                        f"Metadata with key {meta_key} already exists and overwriting=False.")
+                d[meta_key] = data[1]
+        # post_label_pth = d['post_label']
+        # with h5py.File(post_label_pth, 'r') as hf:
+        #     data = hf['post_label'][()]
+        # d['post_label'] = data[0]
+        return d
+
+
+import numpy as np
+import torch
+from monai.transforms import MapTransform
+from scipy.ndimage import distance_transform_edt
+
+class ComputeTSDFd(MapTransform):
+    """
+    Computes the Truncated Signed Distance Function (TSDF) for binary masks.
+    Inside the mask is negative, outside is positive, boundary is 0.
+    Output is normalized between [-1, 1].
+    """
+    def __init__(self, keys, truncation_distance=5.0, allow_missing_keys=False):
+        super().__init__(keys, allow_missing_keys)
+        self.truncation_distance = truncation_distance
+
+    def __call__(self, data):
+        d = dict(data)
+        for key in self.key_iterator(d):
+            mask = d[key]
+            
+            # Convert to numpy for fast EDT computation on the CPU DataLoader
+            if isinstance(mask, torch.Tensor):
+                mask_np = mask.detach().cpu().numpy()
+            else:
+                mask_np = mask
+
+            # Initialize output tensor
+            tsdf_out = np.zeros_like(mask_np, dtype=np.float32)
+            
+            # Process each channel independently (usually [C, H, W, D])
+            for c in range(mask_np.shape[0]):
+                binary_mask = mask_np[c] > 0.5
+                
+                # 1. Distance from outside to the boundary (0 inside the mask)
+                outside_dist = distance_transform_edt(1 - binary_mask)
+                
+                # 2. Distance from inside to the boundary (0 outside the mask)
+                inside_dist = distance_transform_edt(binary_mask)
+                
+                # 3. Create SDF (positive outside, negative inside)
+                sdf = outside_dist - inside_dist
+                
+                # 4. Truncate at margins and normalize to [-1, 1] range
+                tsdf = np.clip(sdf, -self.truncation_distance, self.truncation_distance)
+                tsdf = tsdf / self.truncation_distance
+                
+                tsdf_out[c] = tsdf
+                
+            # Return tensor in same device/format it arrived in
+            d[key] = torch.from_numpy(tsdf_out) if isinstance(mask, torch.Tensor) else tsdf_out
+            
+        return d
+
+class RandZoomd_select(RandZoomd):
+    def __call__(self, data):
+        d = dict(data)
+        name = d['name']
+        key = get_key(name)
+        if (key not in ['10_03', '10_06', '10_07', '10_08', '10_09', '10_10']):
+            return d
+        d = super().__call__(d)
+        return d
+
+
+class RandCropByPosNegLabeld_select(RandCropByPosNegLabeld):
+    def __call__(self, data):
+        d = dict(data)
+        name = d['name']
+        key = get_key(name)
+        # if key in ['10_03', '10_07', '10_08', '04']
+        if key in ['10_03', '10_07', '10_08', '04', '05']:
+            return d
+        d = super().__call__(d)
+        return d
+
+
+class RandCropByLabelClassesd_select(RandCropByLabelClassesd):
+    def __call__(self, data):
+        d = dict(data)
+        name = d['name']
+        key = get_key(name)
+        # print('key',key)
+        # if key in ['10_03', '10_07', '10_08', '04']
+        if key not in ['10_03', '10_07', '10_08', '04', '05']:
+            return d
+        d = super().__call__(d)
+        return d
+
+
+class Compose_Select(Compose):
+    def __call__(self, input_):
+        name = input_['name']
+        key = get_key(name)
+        for index, _transform in enumerate(self.transforms):
+            # for RandCropByPosNegLabeld and RandCropByLabelClassesd case
+            if (key in ['10_03', '10_07', '10_08', '04']) and (index == 8):
+                continue
+            elif (key not in ['10_03', '10_07', '10_08', '04']) and (index == 9):
+                continue
+            # for RandZoomd case
+            if (key not in ['10_03', '10_06', '10_07', '10_08', '10_09', '10_10']) and (index == 7):
+                continue
+            input_ = apply_transform(
+                _transform, input_, self.map_items, self.unpack_items, self.log_stats)
+        return input_
+
+import torch
+from monai.transforms import MapTransform
+from monai.data import MetaTensor
+
+class GenerateTumorHeatmapd(MapTransform):
+    """
+    Calculates the center of mass of a binary mask and generates a 3D 
+    Gaussian heatmap centered on that point.
+    """
+    def __init__(self, ref_key="tumor_mask", out_key="heatmap", sigma=5.0, allow_missing_keys=False):
+        super().__init__([ref_key], allow_missing_keys)
+        self.ref_key = ref_key
+        self.out_key = out_key
+        self.sigma = sigma  # Controls how "wide" the target region is
+
+    def __call__(self, data):
+        d = dict(data)
+        mask = d[self.ref_key]
+        
+        # Ensure it's a tensor for fast math
+        mask_tensor = mask if isinstance(mask, torch.Tensor) else torch.tensor(mask)
+        
+        # Assuming shape is [Channel, X, Y, Z]
+        binary_mask = (mask_tensor[0] > 0).float()
+        indices = torch.nonzero(binary_mask)
+        
+        if len(indices) == 0:
+            # Fallback if no tumor is present (blank heatmap)
+            heatmap = torch.zeros_like(mask_tensor)
+        else:
+            # 1. Get exact X, Y, Z centroid
+            centroid = indices.float().mean(dim=0)
+            
+            # 2. Generate 3D grid
+            X, Y, Z = binary_mask.shape
+            x_grid, y_grid, z_grid = torch.meshgrid(
+                torch.arange(X, device=mask_tensor.device),
+                torch.arange(Y, device=mask_tensor.device),
+                torch.arange(Z, device=mask_tensor.device),
+                indexing='ij'
+            )
+            
+            # 3. Calculate Gaussian distance 
+            dist_sq = (x_grid - centroid[0])**2 + (y_grid - centroid[1])**2 + (z_grid - centroid[2])**2
+            heatmap = torch.exp(-dist_sq / (2 * self.sigma**2))
+            
+            # Add channel dimension back -> [1, X, Y, Z]
+            heatmap = heatmap.unsqueeze(0)
+            
+            
+        d[self.out_key] = heatmap
+        return d
+
+
+def get_loader(args):
+    train_transforms = Compose(
+        [
+            # 1. Load data
+            LoadImageh5d(keys=["tumor_mask", "organ_mask"]),
+            EnsureChannelFirstd(keys=["tumor_mask", "organ_mask"]),
+            
+            # 2. Restructure the full volume FIRST
+            Orientationd(keys=["tumor_mask", "organ_mask"], axcodes="RAS"),
+            Spacingd(
+                keys=["tumor_mask", "organ_mask"],
+                pixdim=(args.space_x, args.space_y, args.space_z),
+                mode=("nearest", "nearest"), 
+            ),
+            SpatialPadd(
+                keys=["tumor_mask", "organ_mask"], 
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z), 
+                mode='constant'
+            ),
+
+            # 3. GENERATE THE HEATMAP BEFORE CROPPING
+            # You can adjust sigma. 5.0 means the "hotspot" radius is roughly 10-15 voxels wide
+            GenerateTumorHeatmapd(ref_key="tumor_mask", out_key="heatmap", sigma=8.0),
+
+            # 4. Crop and Augment (Heatmap gets sliced exactly like the masks)
+            RandCropByLabelClassesd(
+                keys=["tumor_mask", "organ_mask", "heatmap"], # Added heatmap
+                label_key="tumor_mask",
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                ratios=[0, 1],
+                num_classes=2,
+                num_samples=args.num_samples,
+            ),
+            RandRotate90d(
+                keys=["tumor_mask", "organ_mask", "heatmap"], # Added heatmap
+                prob=0.10,
+                max_k=3,
+            ),
+            
+            # 5. Compute TSDF on the cropped mask patches
+            # NOTE: Heatmap is NOT included here. We want it to stay a 0-to-1 Gaussian.
+            ComputeTSDFd(keys=["tumor_mask", "organ_mask"]),
+
+            # 6. Finalize
+            ToTensord(keys=["tumor_mask", "organ_mask", "heatmap"]),
+        ]
+    )
+    val_transforms = Compose(
+        [
+            LoadImageh5d(keys=["image", "tumor_mask", "organ_mask"]),
+            EnsureChannelFirstd(keys=["image", "tumor_mask", "organ_mask"]),
+            Orientationd(keys=["image", "tumor_mask",
+                         "organ_mask"], axcodes="RAS"),
+
+            Spacingd(
+                keys=["image", "tumor_mask", "organ_mask"],
+                pixdim=(args.space_x, args.space_y, args.space_z),
+                mode=("bilinear", "nearest", "nearest"),
+            ),
+
+            ScaleIntensityRanged(
+                keys=["image"],  # Only CT image is scaled
+                a_min=args.a_min,
+                a_max=args.a_max,
+                b_min=args.b_min,
+                b_max=args.b_max,
+                clip=True,
+            ),
+
+            CropForegroundd(keys=["image", "tumor_mask",
+                            "organ_mask"], source_key="image"),
+
+            RandCropByLabelClassesd(
+                keys=["image", "tumor_mask", "organ_mask"],
+                label_key="tumor_mask",
+                spatial_size=(args.roi_x, args.roi_y, args.roi_z),
+                ratios=[0, 1],
+                num_classes=2,
+                num_samples=args.num_samples,
+                image_key="image",
+                image_threshold=0,
+            ),
+
+            ToTensord(keys=["image", "tumor_mask", "organ_mask"]),
+
+        ]
+    )
+
+    # breakpoint()
+
+    # breakpoint()
+    if args.phase == 'train':
+        # training dict part
+
+        train_input = pd.read_csv(os.path.join(
+            args.data_txt_path, args.dataset_list, f'{args.datafile}'))
+
+
+        train_input["tumor_mask"] = train_input.apply(
+            lambda row: os.path.join(args.segmentations_root_path, str(
+                row["bdmap_id"]), "segmentations", f"{row['organ']}_lesion.nii.gz"),
+            axis=1
+        )
+
+        train_input["organ_mask"] = train_input.apply(
+            lambda row: os.path.join(args.segmentations_root_path, str(
+                row["bdmap_id"]), "segmentations", f"{row['organ']}.nii.gz"),
+            axis=1
+        )
+
+        organ_mapping = {
+            'spleen': 0,
+            'bladder': 1,
+            'gallbladder': 2,
+            'esophagus': 3,
+            'stomach': 4,
+            'duodenum': 5,
+            'colon': 6,
+            'prostate': 7,
+            'uterus': 8
+        }
+
+        train_input = train_input[train_input["organ"].isin(list(organ_mapping.keys()))]
+
+        train_input["organ"] = train_input.apply(
+            lambda row: organ_mapping[row["organ"]], axis=1)
+
+        data_dicts_train = train_input.to_dict("records")
+        print('train len {}'.format(len(data_dicts_train)))
+        data_dicts_train = data_dicts_train[:10]  # TO REMOVE
+
+        persistent_cache_dir = os.path.join(
+            args.data_root_path, "monai_persistent_cache")
+        os.makedirs(persistent_cache_dir, exist_ok=True)
+
+        if args.cache_dataset:
+            if args.uniform_sample:
+                # 2. Use your new class and pass the cache_dir
+                train_dataset = UniformCacheDataset(
+                    data=data_dicts_train,
+                    transform=train_transforms,
+                    cache_dir=persistent_cache_dir,
+                    datasetkey=args.datasetkey
+                )
+            else:
+                # 3. Or use the standard PersistentDataset
+                train_dataset = PersistentDataset(
+                    data=data_dicts_train,
+                    transform=train_transforms,
+                    cache_dir=persistent_cache_dir
+                )
+        else:
+            if args.uniform_sample:
+                train_dataset = UniformDataset(
+                    data=data_dicts_train, transform=train_transforms, datasetkey=args.datasetkey)
+            else:
+                train_dataset = Dataset(
+                    data=data_dicts_train, transform=train_transforms)
+        train_sampler = DistributedSampler(
+            dataset=train_dataset, even_divisible=True, shuffle=True) if args.dist else None
+        # breakpoint()
+        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.num_workers,
+                                  collate_fn=list_data_collate, sampler=train_sampler)
+        return train_loader, train_sampler, len(train_dataset)
+        # return train_loader
+
+    if args.phase == 'validation':
+        # validation dict part
+        val_img = []
+        val_lbl = []
+        val_name = []
+        for item in args.dataset_list:
+            for line in open(os.path.join(args.data_txt_path,  item, 'real_huge_train_0.txt')):
+                name = line.strip().split()[1].split('.')[0]
+                val_img.append(args.data_root_path + line.strip().split()[0])
+                val_lbl.append(args.data_root_path + line.strip().split()[1])
+                val_name.append(name)
+        data_dicts_val = [{'image': image, 'label': label, 'name': name}
+                          for image, label, name in zip(val_img, val_lbl, val_name)]
+        print('val len {}'.format(len(data_dicts_val)))
+
+        if args.cache_dataset:
+            val_dataset = CacheDataset(
+                data=data_dicts_val, transform=val_transforms, cache_rate=args.cache_rate)
+        else:
+            val_dataset = Dataset(data=data_dicts_val,
+                                  transform=val_transforms)
+        val_loader = DataLoader(
+            val_dataset, batch_size=1, shuffle=False, num_workers=4, collate_fn=list_data_collate)
+        return val_loader, val_transforms, len(val_dataset)
+        # return val_loader
+
+
+def get_key(name):
+    # input: name
+    # output: the corresponding key
+    dataset_index = int(name[0:2])
+    if dataset_index == 10:
+        template_key = name[0:2] + '_' + name[17:19]
+    else:
+        template_key = name[0:2]
+    return template_key
+
+
+if __name__ == "__main__":
+    train_loader, test_loader = partial_label_dataloader()
+    for index, item in enumerate(test_loader):
+        print(item['image'].shape, item['label'].shape, item['task_id'])
+        input()

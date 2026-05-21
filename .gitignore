@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PyTorch / training
+checkpoints/
+runs/
+logs/
+events.out.tfevents.*
+*.pt
+*.pth
+
+# Hydra
+outputs/
+multirun/
+
+# Debug / generated data
+debug_reconstructions/
+debug_vis/
+*.nii.gz
+*.nii
+
+# Pretrained weights
+pretrained_models/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Large datasets
+data/
+datasets/
+cache/
+tmp/
+
+tumor_mask_pairs.csv
+AbdomenAtlasPro.txt
+
+model_weight
