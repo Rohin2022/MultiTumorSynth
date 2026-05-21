@@ -1,13 +1,15 @@
-from re import I
-import sys, os
-sys.path.append(os.getcwd())
-from ddpm import Unet3D, GaussianDiffusion, Trainer
-import hydra
-from omegaconf import DictConfig, OmegaConf, open_dict
-import torch
-import os
-from ddpm.unet import UNet
 from dataset.dataloader import get_loader
+from ddpm.unet import UNet
+import os
+import torch
+from omegaconf import DictConfig, OmegaConf, open_dict
+import hydra
+from ddpm import Unet3D, GaussianDiffusion, Trainer
+from re import I
+import sys
+import os
+sys.path.append(os.getcwd())
+
 
 @hydra.main(config_path='config', config_name='base_cfg', version_base=None)
 def run(cfg: DictConfig):
@@ -21,7 +23,8 @@ def run(cfg: DictConfig):
         model = Unet3D(
             dim=cfg.model.diffusion_img_size,
             dim_mults=cfg.model.dim_mults,
-            channels=cfg.model.diffusion_num_channels,     # target (1) + img_cond (VQ_dim) + organ (1) + feat (1)
+            # target (1) + img_cond (VQ_dim) + organ (1) + feat (1)
+            channels=cfg.model.diffusion_num_channels,
             out_dim=1                          # We are generating a 1-channel mask!
         ).cuda()
     else:
@@ -33,12 +36,11 @@ def run(cfg: DictConfig):
         num_frames=cfg.model.diffusion_depth_size,
         channels=cfg.model.diffusion_num_channels,
         timesteps=cfg.model.timesteps,
-        loss_type=cfg.model.loss_type,
+        loss_type=cfg.model.loss_type
     ).cuda()
 
     train_dataloader, train_sampler, dataset_size = get_loader(cfg.dataset)
-    val_dataloader=None
-
+    val_dataloader = None
 
     trainer = Trainer(
         diffusion,
@@ -54,6 +56,8 @@ def run(cfg: DictConfig):
         num_sample_rows=cfg.model.num_sample_rows,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
+        voxel_spacing=(cfg.dataset.space_x,
+                       cfg.dataset.space_y, cfg.dataset.space_z)
     )
 
     if cfg.model.load_milestone:

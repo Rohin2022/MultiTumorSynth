@@ -195,7 +195,8 @@ class PreNorm(nn.Module):
 class Block(nn.Module):
     def __init__(self, dim, dim_out, groups=8):
         super().__init__()
-        self.proj = nn.Conv3d(dim, dim_out, (1, 3, 3), padding=(0, 1, 1), padding_mode="replicate")
+        self.proj = nn.Conv3d(dim, dim_out, (1, 3, 3), padding=(
+            0, 1, 1), padding_mode="replicate")
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
 
@@ -430,6 +431,8 @@ class Unet3D(nn.Module):
         )
 
         # text conditioning
+        
+        
 
         self.has_cond = exists(cond_dim) or use_bert_text_cond
         cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
@@ -500,17 +503,16 @@ class Unet3D(nn.Module):
         **kwargs
     ):
         logits = self.forward(*args, null_cond_prob=0., **kwargs)
-        
+
         # If scale is 1 or no condition is passed, return standard logits
         if cond_scale == 1 or 'cond' not in kwargs or kwargs['cond'] is None:
             return logits
 
         # Unconditional pass: drop 100% of the conditions
         null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
-        
+
         # CFG Extrapolation
         return null_logits + (logits - null_logits) * cond_scale
-
 
     def forward(
         self,
@@ -529,10 +531,10 @@ class Unet3D(nn.Module):
             mask = prob_mask_like((batch,), null_cond_prob, device=device)
             # Reshape to (B, 1, 1, 1, 1) to broadcast across 3D spatial dimensions
             mask_spatial = mask.view(batch, 1, 1, 1, 1)
-            
+
             # Replace dropped conditions with zeros
             cond = torch.where(mask_spatial, torch.zeros_like(cond), cond)
-            
+
             # Concatenate conditions to input
             x = torch.cat([x, cond], dim=1)
 
@@ -548,7 +550,7 @@ class Unet3D(nn.Module):
         t = self.time_mlp(time) if exists(self.time_mlp) else None
 
         # REMOVE the old "if self.has_cond:" block that tried to cat cond to t
-        
+
         h = []
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
             x = block1(x, t)
@@ -618,8 +620,6 @@ class GaussianDiffusion(nn.Module):
         self.image_size = image_size
         self.num_frames = num_frames
         self.denoise_fn = denoise_fn
-
-
 
         betas = cosine_beta_schedule(timesteps)
 
@@ -759,8 +759,6 @@ class GaussianDiffusion(nn.Module):
         organ_mask_p = organ_mask.permute(0, 1, -1, -3, -2)
         cond_features_p = conditional_features.permute(0, 1, -1, -3, -2)
 
-
-
         # 3. Downsample masks to latent space (24x24x24)
         latent_spatial_dims = img_cond.shape[-3:]
 
@@ -862,7 +860,7 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         # We pass target_mask as the main input to p_losses!
-        return self.p_losses(target_mask, t, cond=cond, null_cond_prob=null_cond_prob,*args, **kwargs)
+        return self.p_losses(target_mask, t, cond=cond, null_cond_prob=null_cond_prob, *args, **kwargs)
 
 
 # trainer class
@@ -904,6 +902,7 @@ class Trainer(object):
         num_sample_rows=1,
         max_grad_norm=None,
         num_workers=20,
+        voxel_spacing=(1.0, 1.0, 1.0)
     ):
         super().__init__()
         self.model = diffusion_model
@@ -940,6 +939,8 @@ class Trainer(object):
         self.writer = SummaryWriter(str(self.results_folder)+'/logs')
 
         self.reset_parameters()
+
+        self.space_x, self.space_y, self.space_z = voxel_spacing
 
     def reset_parameters(self):
         self.ema_model.load_state_dict(self.model.state_dict())
@@ -1022,13 +1023,13 @@ class Trainer(object):
                 tumor_mask = data['tumor_mask'].cuda()
                 organ_mask = data['organ_mask'].cuda()
                 heatmap = data["heatmap"].cuda()
-
+                print(tumor_mask.shape)
                 conditional_features = self.prepare_conditional(
                     tumor_mask.shape, data).cuda()
 
                 with autocast(enabled=self.amp):
                     loss = self.model(
-                        heatmap = heatmap,
+                        heatmap=heatmap,
                         tumor_mask=tumor_mask,                    # Target for diffusion!
                         organ_mask=organ_mask,                    # Condition
                         conditional_features=conditional_features,  # Condition
@@ -1060,7 +1061,7 @@ class Trainer(object):
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every
-                self.save(milestone) # Save the periodic checkpoint
+                self.save(milestone)  # Save the periodic checkpoint
 
                 # 2. Check if this milestone is also the best version so far
                 if loss.item() < best_train_loss:
@@ -1092,22 +1093,18 @@ class Trainer(object):
                     cond_feats_p = conditional_features.permute(
                         0, 1, -1, -3, -2)
 
-                    
                     # 3. Downsample and Concatenate Conditioners
                     feat_cond = F.interpolate(
                         cond_feats_p.float(), size=tumor_mask_p.shape[-3:])
                     cond = torch.cat([organ_mask_p, feat_cond, heatmap], dim=1)
 
 
-                    # 4. Prepare Target and Add Noise (Forward Diffusion)
-                    target_mask = tumor_mask_p
-
                     # Diffuse to T/2 (Halfway noise) to test reconstruction
                     # 4. Start from PURE NOISE (Testing true generation)
                     # 4. Start from PURE NOISE (Testing true generation)
                     T_START = self.ema_model.num_timesteps
-                    
-                    # Instead of q_sample, we just create pure Gaussian noise 
+
+                    # Instead of q_sample, we just create pure Gaussian noise
                     # with the exact shape and device as our target
                     noisy_latent = torch.randn_like(tumor_mask_p)
 
@@ -1117,10 +1114,10 @@ class Trainer(object):
                         # Timesteps must be 0-indexed (T_START - 1 down to 0)
                         t_i = torch.full(
                             (recon_latent.shape[0],), i, device=recon_latent.device, dtype=torch.long)
-                        
+
                         # Set cond_scale=1.0 to disable CFG during the overfit test!
                         recon_latent = self.ema_model.p_sample(
-                            recon_latent, t_i, cond=cond, cond_scale=2.0) 
+                            recon_latent, t_i, cond=cond, cond_scale=2.0)
 
                     recon = recon_latent.permute(0, 1, -2, -1, -3)
 
@@ -1133,7 +1130,7 @@ class Trainer(object):
                     # Convert to uint8 so ITK-SNAP recognizes them as segmentation labels
                     masks_np = generated_masks.cpu().numpy().astype(np.uint8)
                     targets_np = tumor_mask.cpu().numpy().astype(np.uint8)
-                    
+
                     # Safely move the raw continuous tensor to numpy
                     raw_np = recon_normalized.cpu().numpy()
 
@@ -1141,21 +1138,30 @@ class Trainer(object):
                     for b_idx in range(min(3, masks_np.shape[0])):
                         pred_3d = masks_np[b_idx, 0, :, :, :]
                         targ_3d = targets_np[b_idx, 0, :, :, :]
-                        raw_3d = raw_np[b_idx, 0, :, :, :] 
+                        raw_3d = raw_np[b_idx, 0, :, :, :]
 
                         # Only save if there is actually a tumor in the Ground Truth to look at
                         if targ_3d.sum() > 0:
+                            affine = np.array([
+                                [self.space_x, 0, 0, 0],
+                                [0, self.space_y, 0, 0],
+                                [0, 0, self.space_z, 0],
+                                [0, 0, 0, 1]
+                            ])
                             nib.save(
-                                nib.Nifti1Image(pred_3d, np.eye(4)),
-                                str(debug_folder / f"step_{self.step}_sample_{b_idx}_RECON.nii.gz")
+                                nib.Nifti1Image(pred_3d, affine=affine),
+                                str(debug_folder /
+                                    f"step_{self.step}_sample_{b_idx}_RECON.nii.gz")
                             )
                             nib.save(
-                                nib.Nifti1Image(targ_3d, np.eye(4)),
-                                str(debug_folder / f"step_{self.step}_sample_{b_idx}_GT.nii.gz")
+                                nib.Nifti1Image(targ_3d, affine=affine),
+                                str(debug_folder /
+                                    f"step_{self.step}_sample_{b_idx}_GT.nii.gz")
                             )
                             nib.save(
-                                nib.Nifti1Image(raw_3d, np.eye(4)), 
-                                str(debug_folder / f"step_{self.step}_sample_{b_idx}_RAW_RECON.nii.gz")
+                                nib.Nifti1Image(raw_3d, affine=affine),
+                                str(debug_folder /
+                                    f"step_{self.step}_sample_{b_idx}_RAW_RECON.nii.gz")
                             )
                 self.ema_model.train()
 

@@ -1,37 +1,51 @@
+from dataset.dataloader import get_loader
+import numpy as np
+import nibabel as nib
+import torch.nn.functional as F
+import torch
+from omegaconf import DictConfig, open_dict
+import hydra
 import os
 from ddpm import Unet3D, GaussianDiffusion
+from pathlib import Path
+from tqdm import tqdm
 
 import sys
 sys.path.append(os.getcwd())
 
-import hydra
-from omegaconf import DictConfig, open_dict
-import torch
-import torch.nn.functional as F
-import nibabel as nib
-import numpy as np
-
-from dataset.dataloader import get_loader
-
-# 1. Bring in your helper function!
-def prepare_conditional(volume_shape, data):
+def prepare_conditional(spatial_shape, data):
+    """
+    spatial_shape: strictly a 3-tuple representing (Depth, Height, Width). e.g., (32, 32, 32)
+    Outputs tensor of shape: (Batch, 1, Depth, Height, Width)
+    """
     conditional_feature_list = [
-        "organ", "diameter_x_mm", "diameter_y_mm", "diameter_z_mm", 
-        "mean_x_mm", "mean_y_mm", "mean_z_mm", "std_x_mm", "std_y_mm", 
+        "organ", "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
+        "mean_x_mm", "mean_y_mm", "mean_z_mm", "std_x_mm", "std_y_mm",
         "std_z_mm", "volume_ml"
     ]
-    conditional_volume = torch.zeros(volume_shape)
-    sheets_per_feature = volume_shape[-1] // len(conditional_feature_list)
+
+    batch_size = data[conditional_feature_list[0]].shape[0]
     
+    # Restored to EXACTLY 1 channel so UNet receives the 4 total channels it expects
+    num_channels = 1 
+
+    conditional_volume = torch.zeros(
+        (batch_size, num_channels, spatial_shape[0], spatial_shape[1], spatial_shape[2])
+    )
+
+    # Slice the features along the Depth dimension (spatial_shape[0])
+    depth = spatial_shape[0]
+    sheets_per_feature = depth // len(conditional_feature_list)
+
     for i, key in enumerate(conditional_feature_list):
         start_idx = sheets_per_feature * i
-        if i == len(conditional_feature_list) - 1:
-            end_idx = volume_shape[-1]
-        else:
-            end_idx = sheets_per_feature * (i + 1)
-            
-        feature_data = torch.asarray(data[key]).reshape(volume_shape[0], 1, 1, 1, 1)
-        conditional_volume[:, :, :, :, start_idx:end_idx] = feature_data
+        end_idx = depth if i == len(conditional_feature_list) - 1 else sheets_per_feature * (i + 1)
+
+        # feature_data shape: (B, 1, 1, 1, 1) - broadcasts across the depth slice, height, and width
+        feature_data = torch.as_tensor(data[key]).view(batch_size, 1, 1, 1, 1)
+
+        # Assign strictly to the DEPTH slices
+        conditional_volume[:, :, start_idx:end_idx, :, :] = feature_data
 
     return conditional_volume
 
@@ -50,147 +64,105 @@ def reconstruct(cfg: DictConfig):
         model = Unet3D(
             dim=cfg.model.diffusion_img_size,
             dim_mults=cfg.model.dim_mults,
-            channels=cfg.model.diffusion_num_channels, 
-            out_dim=1 
+            channels=cfg.model.diffusion_num_channels,
+            out_dim=1
         ).to(device)
     else:
         raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")
 
     diffusion = GaussianDiffusion(
         model,
-        vqgan_ckpt=cfg.model.vqgan_ckpt,
         image_size=cfg.model.diffusion_img_size,
         num_frames=cfg.model.diffusion_depth_size,
         channels=cfg.model.diffusion_num_channels,
         timesteps=cfg.model.timesteps,
-        loss_type=cfg.model.loss_type,
+        loss_type=cfg.model.loss_type
     ).to(device)
 
     print("2. Loading Checkpoint...")
     ckpt_path = os.path.join(cfg.model.results_folder, 'model_best.pt')
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Could not find checkpoint at {ckpt_path}")
-    
+
     data = torch.load(ckpt_path, map_location=device)
-    diffusion.load_state_dict(data['ema']) 
+    diffusion.load_state_dict(data['ema'])
     diffusion.eval()
 
     print("3. Loading Data & Diagnosing Labels...")
     train_dataloader, _, _ = get_loader(cfg.dataset)
+    train_data = next(iter(train_dataloader))
+
+    batch_size = train_data["heatmap"].shape[0]
+
+    # Strictly separate spatial shape from 5D tensor shapes
+    spatial_shape = (32, 32, 32)
+    tumor_mask_dims = (batch_size, 1, 32, 32, 32)
+
+    # Move to GPU and ensure standard (B, C, D, H, W)
+    heatmap = train_data["heatmap"].permute(0, 1, -1, -3, -2).cuda()
+    organ_mask_p = train_data["organ_mask"].permute(0, 1, -1, -3, -2).cuda()
     
-    found_tumor = False
-    for batch_idx, batch in enumerate(train_dataloader):
-        raw_tumor_mask = batch["tumor_mask"].to(device)
+    # Conditional features already generated as (B, C, D, H, W)
+    feat_cond = prepare_conditional(spatial_shape, train_data).cuda()
+
+    # Concatenate along the channel dimension (dim=1)
+    cond = torch.cat([organ_mask_p, feat_cond, heatmap], dim=1)
+    print(f"Condition Tensor Shape: {cond.shape}") # Should be (B, 34, 32, 32, 32)
+
+    T_START = 1000
+    noisy_latent = torch.randn(tumor_mask_dims).cuda()
+
+    for i in tqdm(reversed(range(T_START))):
+        t_i = torch.full((batch_size,), i, device=device, dtype=torch.long)
         
-        # Print the unique values present in the raw mask
-        unique_vals = torch.unique(raw_tumor_mask).tolist()
-        print(f"Batch {batch_idx} - Raw tumor_mask unique values: {unique_vals}")
-        
-        # Check if there is a '2' (your original target)
-        if 2 in unique_vals:
-            print("--> Found a label '2'! Applying mapping...")
-            tumor_mask = raw_tumor_mask.clone()
-            tumor_mask[tumor_mask == 1] = 0
-            tumor_mask[tumor_mask == 2] = 1
-            found_tumor = True
-            
-        # Or, check if it's already a binary mask (just 0 and 1)
-        elif 1 in unique_vals and len(unique_vals) <= 2:
-            print("--> Found label '1'. This mask is already binary! Skipping mapping...")
-            tumor_mask = raw_tumor_mask.clone()
-            # NO MAPPING NEEDED
-            found_tumor = True
-            
-        if found_tumor:
-            image = batch["image"].to(device)
-            organ_mask = batch["organ_mask"].to(device)
-            
-            # Apply organ mask corrections safely
-            if 2 in torch.unique(organ_mask):
-                organ_mask[organ_mask == 1] = 0
-                organ_mask[organ_mask == 2] = 1
-                
-            break
-            
-    if not found_tumor:
-        raise ValueError("Still completely empty! Check if CropForeground is cropping out the tumor.")
+        # Use diffusion.p_sample if you saved an EMA checkpoint
+        noisy_latent = diffusion.p_sample(
+            noisy_latent, t_i, cond=cond, cond_scale=2.0)
 
-    # Generate conditionals and slice
-    conditional_features = prepare_conditional(tumor_mask.shape, batch).to(device)
-    
-    image = image[0:1]
-    tumor_mask = tumor_mask[0:1]
-    organ_mask = organ_mask[0:1]
-    conditional_features = conditional_features[0:1]
+    # 6. Map from [-1, 1] back to [0, 1]
+    recon = noisy_latent
+    recon_normalized = (recon + 1.0) / 2.0
+    generated_masks = (recon_normalized > 0.5).float()
 
-    print("4. Preparing Conditioners...")
-    with torch.no_grad():
-        # Permute matching the forward pass
-        image_p = image.permute(0, 1, -1, -3, -2)
-        tumor_mask_p = tumor_mask.permute(0, 1, -1, -3, -2)
-        organ_mask_p = organ_mask.permute(0, 1, -1, -3, -2)
-        cond_feats_p = conditional_features.permute(0, 1, -1, -3, -2)
+    masks_np = generated_masks.cpu().numpy().astype(np.uint8)
+    raw_np = recon_normalized.cpu().numpy()
 
-        # Encode Image
-        if diffusion.vqgan is not None:
-            img_cond = diffusion.vqgan.encode(image_p, quantize=False, include_embeddings=True)
-            img_cond = ((img_cond - diffusion.vqgan.codebook.embeddings.min()) /
-                        (diffusion.vqgan.codebook.embeddings.max() - diffusion.vqgan.codebook.embeddings.min())) * 2.0 - 1.0
-        else:
-            img_cond = (image_p - image_p.min()) / (image_p.max() - image_p.min() + 1e-8) * 2.0 - 1.0
+    # Grab the ground truth mask from the dataloader so targets_np doesn't error out
+    tumor_mask = train_data.get("tumor_mask", torch.zeros_like(generated_masks))
+    targets_np = tumor_mask.cpu().numpy().astype(np.uint8)
 
-        # Downsample conditions to latent space
-        latent_spatial = img_cond.shape[-3:]
-        organ_cond = F.interpolate(organ_mask_p.float(), size=latent_spatial)
-        feat_cond = F.interpolate(cond_feats_p.float(), size=latent_spatial)
-        
-        # Concatenate!
-        cond = torch.cat([img_cond, organ_cond, feat_cond], dim=1)
+    debug_folder = Path("debug_folder")
+    debug_folder.mkdir(exist_ok=True)
 
-        # Scale target to [-1, 1] and downsample
-        target_mask = tumor_mask_p * 2.0 - 1.0
-        target_latent = F.interpolate(target_mask, size=latent_spatial)
+    # Dummy spacing values so affine matrix doesn't crash
+    space_x, space_y, space_z = 1.0, 1.0, 1.0 
+    step = "inference"
 
-        print("5. Applying Forward Noise (q_sample)...")
-        # Define how much noise to apply (e.g., 500 out of 1000 steps)
-        T_START = cfg.model.timesteps // 2 
-        t = torch.full((target_latent.shape[0],), T_START, device=device, dtype=torch.long)
-        
-        noisy_latent = diffusion.q_sample(x_start=target_latent, t=t)
+    for b_idx in range(min(3, masks_np.shape[0])):
+        pred_3d = masks_np[b_idx, 0, :, :, :]
+        targ_3d = targets_np[b_idx, 0, :, :, :]
+        raw_3d = raw_np[b_idx, 0, :, :, :]
 
-        print(f"6. Running Reverse Diffusion from t={T_START}...")
-        recon_latent = noisy_latent
-        
-        # Loop backwards from T_START down to 0
-        from tqdm import tqdm
-        for i in tqdm(reversed(range(T_START)), total=T_START, desc="Denoising"):
-            t_i = torch.full((recon_latent.shape[0],), i, device=device, dtype=torch.long)
-            recon_latent = diffusion.p_sample(recon_latent, t_i, cond=cond)
+        if targ_3d.sum() > 0 or True: # Added 'or True' just to ensure it saves for debugging
+            affine = np.array([
+                [space_x, 0, 0, 0],
+                [0, space_y, 0, 0],
+                [0, 0, space_z, 0],
+                [0, 0, 0, 1]
+            ])
+            nib.save(
+                nib.Nifti1Image(pred_3d, affine=affine),
+                str(debug_folder / f"step_{step}_sample_{b_idx}_RECON.nii.gz")
+            )
+            nib.save(
+                nib.Nifti1Image(targ_3d, affine=affine),
+                str(debug_folder / f"step_{step}_sample_{b_idx}_GT.nii.gz")
+            )
+            nib.save(
+                nib.Nifti1Image(raw_3d, affine=affine),
+                str(debug_folder / f"step_{step}_sample_{b_idx}_RAW_RECON.nii.gz")
+            )
 
-        print("7. Post-processing and Saving...")
-        # Upsample back to permuted original size
-        recon = F.interpolate(recon_latent, size=tumor_mask_p.shape[-3:], mode='trilinear')
-        recon = recon.permute(0, 1, -2, -1, -3)
-        tumor_mask_orig = tumor_mask_p.permute(0, 1, -2, -1, -3)
-
-        # Threshold to binary
-        recon = (recon + 1.0) / 2.0
-        recon = (recon > 0.5).float()
-
-        os.makedirs("debug_reconstructions", exist_ok=True)
-        
-        # --- NEW: Convert to uint8 (integers) for ITK-SNAP ---
-        recon_np = recon[0, 0].cpu().numpy().astype(np.uint8)
-        gt_np = tumor_mask_orig[0, 0].cpu().numpy().astype(np.uint8)
-        
-        # --- NEW: Check if there's actually a tumor here! ---
-        print(f"DEBUG: Tumor pixels in Ground Truth: {gt_np.sum()}")
-        print(f"DEBUG: Tumor pixels in Reconstruction: {recon_np.sum()}")
-
-        nib.save(nib.Nifti1Image(recon_np, np.eye(4)), "debug_reconstructions/reconstruction.nii.gz")
-        nib.save(nib.Nifti1Image(gt_np, np.eye(4)), "debug_reconstructions/ground_truth.nii.gz")
-
-        print("Done! Check the 'debug_reconstructions' folder.")
 
 if __name__ == '__main__':
     reconstruct()
