@@ -79,8 +79,8 @@ def load_nifti_and_postprocess(raw_nifti_path, output_path, scale_factor=3, thre
     print(f"Original shape: {raw_data.shape} -> New shape: {cleaned_mask_np.shape}")
 
 if __name__ == "__main__":
-    input_file = "checkpoints/liver_tumor_train/mask_diffusion_train_pro/debug_masks/step_3500_sample_0_RAW_RECON.nii.gz"
-    output_file = "checkpoints/liver_tumor_train/mask_diffusion_train_pro/debug_masks/step_3500_sample_0_CLEANED.nii.gz"
+    input_file = "/projects/bodymaps/Rohin/TumorSynthesis/STEP2.MaskDiffusionModel/inference_masks/step_inference_sample_0_RAW.nii.gz"
+    output_file = "/projects/bodymaps/Rohin/TumorSynthesis/STEP2.MaskDiffusionModel/inference_masks/step_inference_sample_0_CLEAN.nii.gz"
     
     if Path(input_file).exists():
         load_nifti_and_postprocess(

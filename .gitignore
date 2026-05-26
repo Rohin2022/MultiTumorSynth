@@ -26,6 +26,7 @@ multirun/
 
 # Debug / generated data
 debug_reconstructions/
+debug_folder/
 debug_vis/
 *.nii.gz
 *.nii

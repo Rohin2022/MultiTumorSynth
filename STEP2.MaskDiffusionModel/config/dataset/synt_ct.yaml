@@ -3,9 +3,10 @@ image_channels: 1
 fold: 0
 dataset_list: 'abdomen_atlas_pro'
 data_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/
-segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
+segmentations_root_path: /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer/
+organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
 data_txt_path: cross_eval/
-datafile: AbdomenAtlasPro.csv
+datafile: RadiomicsMaskMetricsBadDropped.csv
 dist: False
 batch_size: 4
 num_workers: 16

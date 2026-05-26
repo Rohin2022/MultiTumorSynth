@@ -25,7 +25,9 @@ def run(cfg: DictConfig):
             dim_mults=cfg.model.dim_mults,
             # target (1) + img_cond (VQ_dim) + organ (1) + feat (1)
             channels=cfg.model.diffusion_num_channels,
-            out_dim=1                          # We are generating a 1-channel mask!
+            out_dim=1,
+            num_continuous_conditioners=10,
+            num_organs=9
         ).cuda()
     else:
         raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")

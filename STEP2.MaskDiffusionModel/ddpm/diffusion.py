@@ -21,7 +21,6 @@ from einops import rearrange
 from einops_exts import check_shape, rearrange_many
 from rotary_embedding_torch import RotaryEmbedding
 
-from ddpm.text import tokenize, bert_embed, BERT_MODEL_DIM
 from torch.utils.data import Dataset, DataLoader
 
 import matplotlib.pyplot as plt
@@ -382,12 +381,13 @@ class Unet3D(nn.Module):
         channels=3,
         attn_heads=8,
         attn_dim_head=32,
-        use_bert_text_cond=False,
         init_dim=None,
         init_kernel_size=7,
         use_sparse_linear_attn=True,
         block_type='resnet',
-        resnet_groups=8
+        resnet_groups=8,
+        num_organs=9,
+        num_continuous_conditioners=4
     ):
         super().__init__()
         self.channels = channels
@@ -431,16 +431,22 @@ class Unet3D(nn.Module):
         )
 
         # text conditioning
-        
-        
 
-        self.has_cond = exists(cond_dim) or use_bert_text_cond
-        cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
+        self.num_organs = num_organs
+        # diameters, volumes, means, stds
+        self.num_continuous_conditioners = num_continuous_conditioners
 
-        self.null_cond_emb = nn.Parameter(
-            torch.randn(1, cond_dim)) if self.has_cond else None
+        # Total input to the MLP is now: 9 (one-hot organ) + 4 (continuous) = 13
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(self.num_organs +
+                      self.num_continuous_conditioners, time_dim),
+            nn.SiLU(),
+            nn.LayerNorm(time_dim),
+            nn.Linear(time_dim, time_dim)
+        )
 
-        cond_dim = time_dim + int(cond_dim or 0)
+        nn.init.zeros_(self.cond_mlp[-1].weight)
+        nn.init.zeros_(self.cond_mlp[-1].bias)
 
         # layers
 
@@ -451,7 +457,7 @@ class Unet3D(nn.Module):
         # block type
 
         block_klass = partial(ResnetBlock, groups=resnet_groups)
-        block_klass_cond = partial(block_klass, time_emb_dim=cond_dim)
+        block_klass_cond = partial(block_klass, time_emb_dim=time_dim)
 
         # modules for all layers
         for ind, (dim_in, dim_out) in enumerate(in_out):
@@ -519,23 +525,18 @@ class Unet3D(nn.Module):
         x,
         time,
         cond=None,
+        tabular_cond=None,
         null_cond_prob=0.,
         focus_present_mask=None,
         prob_focus_present=0.
     ):
         batch, device = x.shape[0], x.device
 
-        # 1. Spatial Classifier-Free Guidance Dropout
+        drop_mask = torch.rand(batch, device=device) < null_cond_prob
+
         if exists(cond):
-            # Create a mask of shape (B,) for dropping conditions
-            mask = prob_mask_like((batch,), null_cond_prob, device=device)
-            # Reshape to (B, 1, 1, 1, 1) to broadcast across 3D spatial dimensions
-            mask_spatial = mask.view(batch, 1, 1, 1, 1)
-
-            # Replace dropped conditions with zeros
-            cond = torch.where(mask_spatial, torch.zeros_like(cond), cond)
-
-            # Concatenate conditions to input
+            spatial_mask = drop_mask.view(batch, 1, 1, 1, 1)
+            cond = torch.where(spatial_mask, torch.zeros_like(cond), cond)
             x = torch.cat([x, cond], dim=1)
 
         focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
@@ -547,9 +548,22 @@ class Unet3D(nn.Module):
         r = x.clone()
 
         x = self.init_temporal_attn(x, pos_bias=time_rel_pos_bias)
-        t = self.time_mlp(time) if exists(self.time_mlp) else None
 
-        # REMOVE the old "if self.has_cond:" block that tried to cat cond to t
+        # 3. Handle Timestep & Tabular Embedding
+        t = self.time_mlp(time)
+
+        if tabular_cond is not None:
+            # Generate the embedding from the 11-dimensional vector
+            tab_emb = self.cond_mlp(tabular_cond)  # Shape: (B, time_emb_dim)
+
+            # Reshape mask to (B, 1) for the 1D embedding
+            emb_mask = drop_mask.view(batch, 1)
+
+            # Zero out the tabular embeddings for the dropped batch items
+            tab_emb = torch.where(emb_mask, torch.zeros_like(tab_emb), tab_emb)
+
+            # Add to the timestep embedding
+            t = t + tab_emb
 
         h = []
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
@@ -608,7 +622,6 @@ class GaussianDiffusion(nn.Module):
         *,
         image_size,
         num_frames,
-        text_use_bert_cls=False,
         channels=3,
         timesteps=1000,
         loss_type='l1',
@@ -670,10 +683,6 @@ class GaussianDiffusion(nn.Module):
         register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev)
                         * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
-        # text conditioning parameters
-
-        self.text_use_bert_cls = text_use_bert_cls
-
         # dynamic thresholding when sampling
 
         self.use_dynamic_thres = use_dynamic_thres
@@ -702,9 +711,9 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
+    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, tabular_cond=None, cond_scale=1.):
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale))
+            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, cond_scale=cond_scale))
 
         if clip_denoised:
             s = 1.
@@ -726,10 +735,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, x, t, cond=None, tabular_cond=None, cond_scale=1., clip_denoised=True):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale)
+            x=x, t=t, clip_denoised=clip_denoised, cond=cond, tabular_cond=tabular_cond, cond_scale=cond_scale)
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -737,57 +746,20 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, cond_scale=1.):
+    def p_sample_loop(self, shape, cond=None, tabular_cond=None, cond_scale=1.):
         device = self.betas.device
 
         b = shape[0]
         img = torch.randn(shape, device=device)
-        print('cond', cond.shape)
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
+                (b,), i, device=device, dtype=torch.long), cond=cond, tabular_cond=tabular_cond, cond_scale=cond_scale)
 
         return img
 
     @torch.inference_mode()
     def sample(self, heatmap, organ_mask, conditional_features, cond_scale=1., batch_size=None):
-        import torch.nn.functional as F
-        device = image.device
-        batch_size = image.shape[0]
-
-        # 1. PERMUTE exactly like forward()
-        organ_mask_p = organ_mask.permute(0, 1, -1, -3, -2)
-        cond_features_p = conditional_features.permute(0, 1, -1, -3, -2)
-
-        # 3. Downsample masks to latent space (24x24x24)
-        latent_spatial_dims = img_cond.shape[-3:]
-
-        organ_cond = F.interpolate(
-            organ_mask_p.float(), size=latent_spatial_dims)
-        feat_cond = F.interpolate(
-            cond_features_p.float(), size=latent_spatial_dims)
-
-        # 4. Concatenate
-        cond = torch.cat([img_cond, organ_cond, feat_cond], dim=1)
-
-        # 5. Run Diffusion at 24x24x24
-        channels = 1
-        _sample = self.p_sample_loop(
-            (batch_size, channels, *latent_spatial_dims),
-            cond=cond,
-            cond_scale=cond_scale
-        )
-
-        # 6. Upsample the generated mask back to original permuted resolution (96x96x96)
-        original_spatial_p = image_p.shape[-3:]
-        _sample = F.interpolate(
-            _sample, size=original_spatial_p, mode='trilinear')
-
-        # 7. REVERSE the permutation so it matches the ground truth for ITK-SNAP
-        # Forward permute was (0, 1, -1, -3, -2). The inverse is (0, 1, -2, -1, -3).
-        _sample = _sample.permute(0, 1, -2, -1, -3)
-
-        return _sample
+        raise NotImplementedError("IMPELMENT ROHIN")
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t=None, lam=0.5):
@@ -815,17 +787,13 @@ class GaussianDiffusion(nn.Module):
                     t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, noise=None, **kwargs):
+    def p_losses(self, x_start, t, cond=None, tabular_cond=None, noise=None, **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        if is_list_str(cond):
-            cond = bert_embed(
-                tokenize(cond), return_cls_repr=self.text_use_bert_cls)
-            cond = cond.to(device)
-
-        x_recon = self.denoise_fn(x_noisy, t, cond=cond, **kwargs)
+        x_recon = self.denoise_fn(
+            x_noisy, t, cond=cond, tabular_cond=tabular_cond, **kwargs)
 
         if self.loss_type == 'l1':
             loss = F.l1_loss(noise, x_recon)
@@ -836,20 +804,16 @@ class GaussianDiffusion(nn.Module):
 
         return loss
 
-    def forward(self, heatmap, tumor_mask, organ_mask, conditional_features, null_cond_prob=0.0, *args, **kwargs):
+    def forward(self, heatmap, tumor_mask, organ_mask, tabular_cond, null_cond_prob=0.0, *args, **kwargs):
         # 1. Permute all inputs for 3D processing (B, C, D, H, W)
         tumor_mask = tumor_mask.permute(0, 1, -1, -3, -2)
         organ_mask = organ_mask.permute(0, 1, -1, -3, -2)
-        conditional_features = conditional_features.permute(0, 1, -1, -3, -2)
         heatmap = heatmap.permute(0, 1, -1, -3, -2)
 
         target_mask = tumor_mask
 
-        feat_cond = torch.nn.functional.interpolate(
-            conditional_features, size=target_mask.shape[-3:])
-
         # 4. Concatenate all conditions along the channel dimension (dim=1)
-        cond = torch.cat([organ_mask, feat_cond, heatmap], dim=1)
+        cond = torch.cat([organ_mask, heatmap], dim=1)
 
         # 5. Ensure the target mask matches the UNet's expected spatial dimensions
         # If using Latent Diffusion, you either encode the mask with VQGAN too,
@@ -860,7 +824,7 @@ class GaussianDiffusion(nn.Module):
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         # We pass target_mask as the main input to p_losses!
-        return self.p_losses(target_mask, t, cond=cond, null_cond_prob=null_cond_prob, *args, **kwargs)
+        return self.p_losses(target_mask, t, cond=cond, tabular_cond=tabular_cond, null_cond_prob=null_cond_prob, *args, **kwargs)
 
 
 # trainer class
@@ -875,6 +839,113 @@ def normalize_img(t):
 
 def unnormalize_img(t):
     return (t + 1) * 0.5
+
+
+import os
+import copy
+from pathlib import Path
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.tensorboard import SummaryWriter
+import nibabel as nib
+import json
+
+# --- NEW IMPORTS REQUIRED FOR METRICS ---
+from scipy.ndimage import label
+from skimage.measure import marching_cubes, mesh_surface_area
+
+def compute_diameters_and_coords(mask, spacing):
+    """
+    Computes volume, diameters, PCA-based elongation/flatness, and 
+    marching-cubes-based sphericity for the given 3D mask.
+    """
+    if hasattr(mask, "numpy"):
+        mask = mask.cpu().numpy()
+
+    mask = np.squeeze(mask)
+    spacing = np.array(spacing) # Ensure this is a numpy array for broadcasting!
+
+    COLUMNS = [
+        "bdmap_id", "organ",
+        "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
+        "volume_ml",
+        "sphericity", "surface_volume_ratio",
+        "elongation", "flatness", "max_3d_diameter_mm",
+        "num_components"
+    ]
+
+    zeros = {col: 0.0 for col in COLUMNS if col not in ["bdmap_id", "organ"]}
+    zeros["num_components"] = 0
+
+    bin_mask = mask > 0
+    if not bin_mask.any():
+        return zeros
+
+    # 1. Connected Components Tracking
+    structure = np.ones((3, 3, 3), dtype=bool)
+    _, num_components = label(bin_mask, structure=structure)
+
+    # 2. Extract Physical Coordinates for All Voxels
+    coords = np.argwhere(bin_mask)
+    coords_mm = coords * spacing  # Vectorized conversion to physical space
+
+    # 3. Axis-Aligned Box Diameters
+    min_coords = coords_mm.min(axis=0)
+    max_coords = coords_mm.max(axis=0)
+    # Adding 1 single voxel width to accurately reflect physical boundary span
+    diameters = max_coords - min_coords + spacing
+    max_x, max_y, max_z = diameters[0], diameters[1], diameters[2]
+
+    # 4. Volume
+    voxel_volume_mm3 = spacing[0] * spacing[1] * spacing[2]
+    volume_mm3 = len(coords_mm) * voxel_volume_mm3
+    volume_ml = volume_mm3 / 1000.0
+
+    # 5. Fast Principle Component Analysis (PCA)
+    try:
+        centered_coords = coords_mm - coords_mm.mean(axis=0)
+        cov = np.cov(centered_coords.T)
+
+        eigvals = np.linalg.eigvals(cov)
+        eigvals = np.sort(eigvals)[::-1]  
+        eigvals = np.maximum(eigvals, 1e-8)  
+
+        elongation = float(np.sqrt(eigvals[1] / eigvals[0]))
+        flatness = float(np.sqrt(eigvals[2] / eigvals[0]))
+        max_3d_diameter_mm = float(4.0 * np.sqrt(eigvals[0]))
+    except Exception:
+        elongation, flatness, max_3d_diameter_mm = 0.0, 0.0, 0.0
+
+    # 6. Standard Surface Area via Marching Cubes
+    try:
+        padded = np.pad(bin_mask, 1, mode='constant', constant_values=False)
+        verts, faces, normals, values = marching_cubes(padded, level=0.5, spacing=spacing)
+        surface_area_mm2 = mesh_surface_area(verts, faces)
+
+        surface_volume_ratio = float(surface_area_mm2 / volume_mm3)
+        sphericity = float((np.pi ** (1 / 3) * (6 * volume_mm3) ** (2 / 3)) / surface_area_mm2)
+        sphericity = min(sphericity, 1.0)
+
+    except Exception:
+        # Failsafe for degenerate shapes (e.g., flat 2D slices that cannot be meshed)
+        surface_volume_ratio, sphericity = 0.0, 0.0
+
+    return {
+        "diameter_x_mm": max_x,
+        "diameter_y_mm": max_y,
+        "diameter_z_mm": max_z,
+        "volume_ml": volume_ml,
+        "sphericity": sphericity,
+        "surface_volume_ratio": surface_volume_ratio,
+        "elongation": elongation,
+        "flatness": flatness,
+        "max_3d_diameter_mm": max_3d_diameter_mm,
+        "num_components": int(num_components)
+    }
 
 
 # trainer clas
@@ -978,34 +1049,41 @@ class Trainer(object):
         self.ema_model.load_state_dict(data['ema'], **kwargs)
         self.scaler.load_state_dict(data['scaler'])
 
-    def prepare_conditional(self, volume_shape, data):
-        conditional_feature_list = [
-            "organ", "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
-            "mean_x_mm", "mean_y_mm", "mean_z_mm", "std_x_mm", "std_y_mm",
-            "std_z_mm", "volume_ml"
+    def prepare_conditional_vector(self, data, device):
+        """
+        Extracts tabular features into a single tensor, one-hot encoding the organ.
+        Output shape: (Batch, 19) -> 9 organ classes + 10 numerical features
+        """
+        numerical_features = [
+            "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
+            "volume_ml",
+            "sphericity", "surface_volume_ratio",
+            "elongation", "flatness", "max_3d_diameter_mm",
+            "num_components"
         ]
 
-        conditional_volume = torch.zeros(volume_shape)
+        # 1. Handle the categorical "organ" feature
+        organ_idx = torch.as_tensor(
+            data["organ"], dtype=torch.long, device=device).view(-1)
 
-        sheets_per_feature = volume_shape[-1] // len(conditional_feature_list)
+        # One-hot encode to shape (Batch, 9) and cast back to float32
+        organ_one_hot = F.one_hot(organ_idx, num_classes=9).float()
 
-        for i, key in enumerate(conditional_feature_list):
+        # 2. Handle the remaining continuous numerical features
+        num_tensors = []
+        for key in numerical_features:
+            val = torch.as_tensor(
+                data[key], dtype=torch.float32, device=device).view(-1)
+            num_tensors.append(val)
 
-            # Determine start and end indices for the last dimension
-            start_idx = sheets_per_feature * i
+        # Stack continuous features to shape (Batch, 10)
+        continuous_vector = torch.stack(num_tensors, dim=1)
 
-            # If it's the last feature, take all remaining sheets to avoid dropping data
-            if i == len(conditional_feature_list) - 1:
-                end_idx = volume_shape[-1]
-            else:
-                end_idx = sheets_per_feature * (i + 1)
+        # 3. Concatenate the one-hot organ with the continuous features
+        # Resulting shape: (Batch, 19)
+        cond_vector = torch.cat([organ_one_hot, continuous_vector], dim=1)
 
-            feature_data = torch.asarray(data[key]).reshape(
-                volume_shape[0], 1, 1, 1, 1)
-
-            conditional_volume[:, :, :, :, start_idx:end_idx] = feature_data
-
-        return conditional_volume
+        return cond_vector
 
     def train(
         self,
@@ -1023,16 +1101,17 @@ class Trainer(object):
                 tumor_mask = data['tumor_mask'].cuda()
                 organ_mask = data['organ_mask'].cuda()
                 heatmap = data["heatmap"].cuda()
-                print(tumor_mask.shape)
-                conditional_features = self.prepare_conditional(
-                    tumor_mask.shape, data).cuda()
 
+                device = heatmap.device
+
+                tabular_cond = self.prepare_conditional_vector(
+                    data, device=device)
                 with autocast(enabled=self.amp):
                     loss = self.model(
                         heatmap=heatmap,
                         tumor_mask=tumor_mask,                    # Target for diffusion!
                         organ_mask=organ_mask,                    # Condition
-                        conditional_features=conditional_features,  # Condition
+                        tabular_cond=tabular_cond,  # Condition
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
                         null_cond_prob=0.1
@@ -1075,6 +1154,12 @@ class Trainer(object):
 # ==========================================
             # 3. DEBUG: GENERATE AND SAVE NIFTI MASKS
             # ==========================================
+            if self.step > 0 and self.step % self.update_ema_every == 0:
+                self.step_ema()
+
+            # ==========================================
+            # 3. DEBUG: GENERATE AND SAVE NIFTI MASKS
+            # ==========================================
             if self.step % 500 == 0:
                 print(
                     f"--> [Step {self.step}] Generating debug NIfTI reconstructions...")
@@ -1084,40 +1169,24 @@ class Trainer(object):
                 debug_folder.mkdir(exist_ok=True)
 
                 with torch.no_grad():
-                    import torch.nn.functional as F
-
                     # 1. Permute to match forward()
-                    heatmap = heatmap.permute(0, 1, -1, -3, -2)
+                    heatmap_p = heatmap.permute(0, 1, -1, -3, -2)
                     tumor_mask_p = tumor_mask.permute(0, 1, -1, -3, -2)
                     organ_mask_p = organ_mask.permute(0, 1, -1, -3, -2)
-                    cond_feats_p = conditional_features.permute(
-                        0, 1, -1, -3, -2)
 
-                    # 3. Downsample and Concatenate Conditioners
-                    feat_cond = F.interpolate(
-                        cond_feats_p.float(), size=tumor_mask_p.shape[-3:])
-                    cond = torch.cat([organ_mask_p, feat_cond, heatmap], dim=1)
+                    cond = torch.cat([organ_mask_p, heatmap_p], dim=1)
 
-
-                    # Diffuse to T/2 (Halfway noise) to test reconstruction
-                    # 4. Start from PURE NOISE (Testing true generation)
-                    # 4. Start from PURE NOISE (Testing true generation)
                     T_START = self.ema_model.num_timesteps
 
-                    # Instead of q_sample, we just create pure Gaussian noise
-                    # with the exact shape and device as our target
                     noisy_latent = torch.randn_like(tumor_mask_p)
 
-                    # 5. Denoise back to 0 (Reverse Diffusion)
                     recon_latent = noisy_latent
                     for i in reversed(range(T_START)):
-                        # Timesteps must be 0-indexed (T_START - 1 down to 0)
                         t_i = torch.full(
                             (recon_latent.shape[0],), i, device=recon_latent.device, dtype=torch.long)
 
-                        # Set cond_scale=1.0 to disable CFG during the overfit test!
                         recon_latent = self.ema_model.p_sample(
-                            recon_latent, t_i, cond=cond, cond_scale=2.0)
+                            recon_latent, t_i, cond=cond, tabular_cond=tabular_cond, cond_scale=2.0)
 
                     recon = recon_latent.permute(0, 1, -2, -1, -3)
 
@@ -1125,44 +1194,49 @@ class Trainer(object):
                     recon_normalized = (recon + 1.0) / 2.0
 
                     # 7. Threshold back to binary
-                    generated_masks = (recon_normalized > 0.5).float()
+                    generated_masks = (recon_normalized < 0.5).float()
 
-                    # Convert to uint8 so ITK-SNAP recognizes them as segmentation labels
                     masks_np = generated_masks.cpu().numpy().astype(np.uint8)
-                    targets_np = tumor_mask.cpu().numpy().astype(np.uint8)
-
-                    # Safely move the raw continuous tensor to numpy
                     raw_np = recon_normalized.cpu().numpy()
 
-                    # Use min() just in case the final batch has fewer than 3 samples!
-                    for b_idx in range(min(3, masks_np.shape[0])):
-                        pred_3d = masks_np[b_idx, 0, :, :, :]
-                        targ_3d = targets_np[b_idx, 0, :, :, :]
-                        raw_3d = raw_np[b_idx, 0, :, :, :]
+                    with open("dataset_norm_stats.json", "r") as f:
+                        normalized_stats = json.load(f)
 
-                        # Only save if there is actually a tumor in the Ground Truth to look at
-                        if targ_3d.sum() > 0:
-                            affine = np.array([
-                                [self.space_x, 0, 0, 0],
-                                [0, self.space_y, 0, 0],
-                                [0, 0, self.space_z, 0],
-                                [0, 0, 0, 1]
-                            ])
-                            nib.save(
-                                nib.Nifti1Image(pred_3d, affine=affine),
-                                str(debug_folder /
-                                    f"step_{self.step}_sample_{b_idx}_RECON.nii.gz")
-                            )
-                            nib.save(
-                                nib.Nifti1Image(targ_3d, affine=affine),
-                                str(debug_folder /
-                                    f"step_{self.step}_sample_{b_idx}_GT.nii.gz")
-                            )
-                            nib.save(
-                                nib.Nifti1Image(raw_3d, affine=affine),
-                                str(debug_folder /
-                                    f"step_{self.step}_sample_{b_idx}_RAW_RECON.nii.gz")
-                            )
+                        for b_idx in range(min(3, masks_np.shape[0])):
+                            pred_3d = masks_np[b_idx, 0, :, :, :]
+                            raw_3d = raw_np[b_idx, 0, :, :, :]
+
+                            if pred_3d.sum() > 0:
+                                affine = np.array([
+                                    [self.space_x, 0, 0, 0],
+                                    [0, self.space_y, 0, 0],
+                                    [0, 0, self.space_z, 0],
+                                    [0, 0, 0, 1]
+                                ])
+
+                                metrics = compute_diameters_and_coords(
+                                    pred_3d, (self.space_x, self.space_y, self.space_z))
+                                
+                                volume_delta="unknown"
+                                volume=""
+                                for key in metrics.keys():
+                                    unnormalized_conditioner = data[key][b_idx].item() * normalized_stats[key]["std"] + normalized_stats[key]["mean"]
+                                    print(f"SAMPLE 1: \n {key}: \ndelta = {abs(unnormalized_conditioner-metrics[key])}\n")
+                                    print("================")
+                                    if(key=="volume_ml"):
+                                        volume_delta = abs(unnormalized_conditioner-metrics[key])
+                                        volume = metrics[key]
+
+                                nib.save(
+                                    nib.Nifti1Image(pred_3d, affine=affine),
+                                    str(debug_folder /
+                                        f"step_{self.step}_sample_{b_idx}_RECON_{volume}_{volume_delta}.nii.gz")
+                                )
+                                nib.save(
+                                    nib.Nifti1Image(raw_3d, affine=affine),
+                                    str(debug_folder /
+                                        f"step_{self.step}_sample_{b_idx}_RAW_RECON_{volume}_{volume_delta}.nii.gz")
+                                )   
                 self.ema_model.train()
 
             log_fn(log)
