@@ -6,8 +6,8 @@ data_root_path: '/projects/bodymaps/Data'
 img_path: image_only/AbdomenAtlasPro/AbdomenAtlasPro/
 seg_path: mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
 data_txt_path: cross_eval/recon/
-dist: True
-batch_size: 2
+dist: False
+batch_size: 4
 num_workers: 16
 
 a_min: -175 # -175

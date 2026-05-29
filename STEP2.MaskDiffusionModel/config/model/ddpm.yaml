@@ -1,14 +1,14 @@
 # Have to be derived from VQ-GAN Latent space dimensions
-diffusion_img_size: 32
-diffusion_depth_size: 32
+diffusion_img_size: 64
+diffusion_depth_size: 64
 diffusion_num_channels: 3
 out_dim: 8
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/
-results_folder_postfix: 'mask_diffusion_train_pro_v4'
+results_folder_postfix: 'mask_diffusion_train_pro_v5'
 load_milestone: False
 
-batch_size: 4 # 40
+batch_size: 2 # 40
 num_workers: 16
 logger: wandb
 objective: pred_x0
@@ -19,7 +19,7 @@ timesteps: 1000 # number of steps
 sampling_timesteps: 1000 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
 loss_type: l1 # L1 or L2
 train_num_steps: 80000 # total training steps
-gradient_accumulate_every: 2 # gradient accumulation steps
+gradient_accumulate_every: 4 # gradient accumulation steps
 ema_decay: 0.995 # exponential moving average decay
 amp: True # turn on mixed precision
 num_sample_rows: 1

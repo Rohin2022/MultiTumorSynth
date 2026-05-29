@@ -23,7 +23,7 @@ def run(cfg: DictConfig):
         model = Unet3D(
             dim=cfg.model.diffusion_img_size,
             dim_mults=cfg.model.dim_mults,
-            # target (1) + img_cond (VQ_dim) + organ (1) + feat (1)
+            # target (1) + organ (1) + heatmap (1)
             channels=cfg.model.diffusion_num_channels,
             out_dim=1,
             num_continuous_conditioners=10,

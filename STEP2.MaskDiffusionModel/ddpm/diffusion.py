@@ -1151,16 +1151,11 @@ class Trainer(object):
             if self.step > 0 and self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-# ==========================================
-            # 3. DEBUG: GENERATE AND SAVE NIFTI MASKS
-            # ==========================================
-            if self.step > 0 and self.step % self.update_ema_every == 0:
-                self.step_ema()
 
             # ==========================================
             # 3. DEBUG: GENERATE AND SAVE NIFTI MASKS
             # ==========================================
-            if self.step % 500 == 0:
+            if self.step % 2000 == 0:
                 print(
                     f"--> [Step {self.step}] Generating debug NIfTI reconstructions...")
                 self.ema_model.eval()

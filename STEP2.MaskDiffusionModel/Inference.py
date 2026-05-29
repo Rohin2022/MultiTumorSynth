@@ -202,9 +202,9 @@ def prepare_conditional_vector(data, device):
     return cond_vector
 
 
-def generate_samples(train_data,step, diffusion, cond_scale=2.0):
+def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3.0, 3.0), norm_stats="dataset_norm_stats.json"):
     batch_size = train_data["heatmap"].shape[0]
-    tumor_mask_dims = (batch_size, 1, 32, 32, 32)
+    tumor_mask_dims = (batch_size, 1, 64, 64, 64)
 
     heatmap = train_data["heatmap"].permute(0, 1, -1, -3, -2).cuda()
     organ_mask_p = train_data["organ_mask"].permute(0, 1, -1, -3, -2).cuda()
@@ -233,13 +233,13 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0):
     tumor_mask = train_data.get("tumor_mask", torch.zeros_like(recon_normalized))
     targets_np = tumor_mask.cpu().numpy().astype(np.uint8)
 
-    debug_folder = Path("inference_masks")
+    debug_folder = Path("inference_masks_v2")
     debug_folder.mkdir(exist_ok=True)
 
     # --- PHYSICAL SPACING SETUP ---
     # Assuming original model outputs 3mm spacing
-    base_spacing = (3.0, 3.0, 3.0) 
-    scale_factor = 3
+    base_spacing = spacing
+    scale_factor = spacing[0]
     
     # Calculate the new voxel spacing after upsampling
     post_spacing = (
@@ -260,7 +260,7 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0):
 
     output_metrics = []
 
-    with open("dataset_norm_stats.json", "r") as f:
+    with open(norm_stats, "r") as f:
         normalized_stats = json.load(f)
         
         for b_idx in range(raw_np.shape[0]):
@@ -309,7 +309,12 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0):
     return output_metrics
 
 @hydra.main(config_path='config', config_name='base_cfg', version_base=None)
-def reconstruct(cfg: DictConfig):
+def reconstruct(cfg: DictConfig, test_dataset_name="mask_diffusion_train_pro_v5", test_dataset_file="EvaluationSpacedData.csv", model_name="model_best.pt", spacing=(3.0, 3.0, 3.0), output_file="metrics.csv", cond_scales = [1.0, 2.0, 4.0, 6.0], results_folder_name="mask_diffusion_train_pro_v5", norm_stats="dataset_norm_stats.json"):
+    cfg.dataset.datafile = test_dataset_file
+    cfg.model.results_folder_postfix = results_folder_name
+    cfg.dataset.name = test_dataset_name
+
+
     torch.cuda.set_device(cfg.model.gpus)
     device = torch.device(f"cuda:{cfg.model.gpus}")
 
@@ -338,7 +343,7 @@ def reconstruct(cfg: DictConfig):
     ).to(device)
 
     print("2. Loading Checkpoint...")
-    ckpt_path = os.path.join(cfg.model.results_folder, '75.pt')
+    ckpt_path = os.path.join(cfg.model.results_folder, f'{model_name}')
     data = torch.load(ckpt_path, map_location=device)
     diffusion.load_state_dict(data['ema'])
     diffusion.eval()
@@ -349,12 +354,12 @@ def reconstruct(cfg: DictConfig):
     step = 0
     all_metrics = []
 
-    cond_scales = [1.0, 2.0, 4.0, 6.0]
+    
 
     for train_data in tqdm(loader_iter):
         print(f"STEP: {step+1}")
         for scale in cond_scales:
-            output_metrics = generate_samples(train_data, step+1, diffusion, cond_scale=scale)
+            output_metrics = generate_samples(train_data, step+1, diffusion, cond_scale=scale, spacing=spacing, norm_stats=norm_stats)
             all_metrics.extend(output_metrics)
         print(all_metrics)
         print("================")
@@ -362,8 +367,8 @@ def reconstruct(cfg: DictConfig):
         step += 1
     
     metrics_df = pd.DataFrame(all_metrics)
-    metrics_df.to_csv("stomach_metrics.csv",index=False)
+    metrics_df.to_csv(output_file,index=False)
 
 
 if __name__ == '__main__':
-    reconstruct()
+    reconstruct(test_dataset_file="AAProTrain.csv", spacing=(2.0, 2.0, 2.0), output_file="metrics.csv", cond_scales = [1.0, 2.0, 4.0, 6.0])

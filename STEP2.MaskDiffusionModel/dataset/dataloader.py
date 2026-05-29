@@ -254,7 +254,7 @@ class GenerateTumorHeatmapd(MapTransform):
         else:
             # 1. Get exact X, Y, Z centroid
             centroid = indices.float().mean(dim=0)
-            print(f"CENTROID: {centroid}")
+            #print(f"CENTROID: {centroid}")
 
             # 2. Generate 3D grid
             X, Y, Z = binary_mask.shape
@@ -436,6 +436,11 @@ def get_loader(args):
         train_input = train_input[train_input["organ"].isin(
             list(organ_mapping.keys()))]
         train_input = train_input[train_input["volume_ml"] > 0.0]
+
+        train_input = train_input[train_input["diameter_x_mm"]<(args.roi_x*args.space_x)]
+        train_input = train_input[train_input["diameter_y_mm"]<(args.roi_y*args.space_y)]
+        train_input = train_input[train_input["diameter_z_mm"]<(args.roi_z*args.space_z)]
+
 
         # 2. CALCULATE WEIGHTS FIRST (While volume_ml is still in true mL)
         vol_cutoff = float(train_input['volume_ml'].quantile(0.98))

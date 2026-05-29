@@ -1,7 +1,7 @@
 seed: 1234
 num_workers: 16
 
-gpus: 2
+gpus: 1
 accumulate_grad_batches: 1
 default_root_dir: checkpoints/vq_gan/
 default_root_dir_postfix: 'abdomen_atlas_140k_v2'
@@ -9,7 +9,7 @@ resume: False
 resume_version: 0
 resume_from_checkpoint: ~
 pretrained_checkpoint: ~
-max_steps: 3000
+max_steps: 6000 # MUST BE DOUBLED -> lightning global step is doubled because of two optimizer.step calls
 max_epochs: -1
 precision: bf16-mixed
 gradient_clip_val: 1.0
@@ -21,7 +21,7 @@ lr: 3e-4
 downsample: [4, 4, 4]
 disc_channels: 64
 disc_layers: 3
-discriminator_iter_start: 1000
+discriminator_iter_start: 2000 # MUST BE DOUBLED -> lightning global step is doubled because of two optimizer.step calls
 disc_loss_type: hinge
 image_gan_weight: 1.0
 video_gan_weight: 1.0

@@ -235,6 +235,10 @@ class VQGAN(pl.LightningModule):
         return recon_loss, x_recon, vq_output, perceptual_loss
 
     def training_step(self, batch, batch_idx):
+        import time
+
+        t_data_done = time.perf_counter()  # data is already loaded when training_step is called
+
         opt_ae, opt_disc = self.optimizers()
         sch_ae, sch_disc = self.lr_schedulers()
 
@@ -243,6 +247,7 @@ class VQGAN(pl.LightningModule):
         x = x.contiguous().permute(0, 1, -1, -3, -2).detach()
 
         # Generator step
+        t_forward_start = time.perf_counter()
         opt_ae.zero_grad()
         recon_loss, _, vq_output, aeloss, perceptual_loss, gan_feat_loss = self.forward(x, 0)
         commitment_loss = vq_output['commitment_loss']
@@ -257,10 +262,43 @@ class VQGAN(pl.LightningModule):
         self.manual_backward(discloss)
         self.clip_gradients(opt_disc, gradient_clip_val=self.cfg.model.gradient_clip_val, gradient_clip_algorithm="norm")
         opt_disc.step()
+        t_compute_done = time.perf_counter()
 
         # Step schedulers manually (Lightning won't do it automatically)
         sch_ae.step()
         sch_disc.step()
+
+        # ── Timing Logging ──────────────────────────────────────────────
+        if not hasattr(self, '_timing'):
+            self._timing = {'data': [], 'compute': [], 'last_batch_end': None}
+
+        compute_ms = (t_compute_done - t_forward_start) * 1000
+
+        # Data time = gap between end of last step and when this batch arrived
+        if self._timing['last_batch_end'] is not None:
+            data_ms = (t_data_done - self._timing['last_batch_end']) * 1000
+            self._timing['data'].append(data_ms)
+
+        self._timing['compute'].append(compute_ms)
+        self._timing['last_batch_end'] = t_compute_done
+
+        if batch_idx % 10 == 0 and len(self._timing['data']) > 0:
+            avg_data    = sum(self._timing['data'][-50:])    / len(self._timing['data'][-50:])
+            avg_compute = sum(self._timing['compute'][-50:]) / len(self._timing['compute'][-50:])
+            efficiency  = avg_compute / (avg_compute + avg_data) * 100
+
+            print(
+                f"[Step {batch_idx}] "
+                f"data={avg_data:.0f}ms | "
+                f"compute={avg_compute:.0f}ms | "
+                f"GPU efficiency={efficiency:.1f}% | "
+                f"loss_ae={loss_ae.item():.4f} | "
+                f"discloss={discloss.item():.4f}"
+            )
+
+            self.log('timing/data_ms',    avg_data,    on_step=True)
+            self.log('timing/compute_ms', avg_compute, on_step=True)
+            self.log('timing/efficiency', efficiency,  on_step=True)
 
     def validation_step(self, batch, batch_idx):
         x = batch['image']
