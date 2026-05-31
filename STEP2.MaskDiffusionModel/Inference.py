@@ -1,3 +1,5 @@
+from skimage.measure import marching_cubes, mesh_surface_area
+from scipy.ndimage import label
 from dataset.dataloader import get_loader
 import numpy as np
 import nibabel as nib
@@ -5,7 +7,7 @@ import torch.nn.functional as F
 import pandas as pd
 import torch
 from omegaconf import DictConfig, open_dict
-import hydra
+from hydra import initialize, compose
 import os
 from ddpm import Unet3D, GaussianDiffusion
 from pathlib import Path
@@ -17,6 +19,7 @@ from monai.transforms import FillHoles, KeepLargestConnectedComponent, Compose
 
 import sys
 sys.path.append(os.getcwd())
+
 
 def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5, num_components=1):
     """
@@ -35,23 +38,25 @@ def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5, num_components=1
     elif original_dims == 4:
         pass
     else:
-        raise ValueError(f"Expected 3D (X,Y,Z) or 4D (B,X,Y,Z) input, got {original_dims}D")
+        raise ValueError(
+            f"Expected 3D (X,Y,Z) or 4D (B,X,Y,Z) input, got {original_dims}D")
 
     tensor_mask = tensor_mask.unsqueeze(1)
 
     if scale_factor != 1:
         tensor_mask = F.interpolate(
-            tensor_mask, 
-            scale_factor=scale_factor, 
-            mode='trilinear', 
+            tensor_mask,
+            scale_factor=scale_factor,
+            mode='trilinear',
             align_corners=False
         )
 
-    binary_mask = (tensor_mask < threshold).to(torch.uint8) # Fixed: should be > threshold for mask
+    binary_mask = (tensor_mask < threshold).to(
+        torch.uint8)  # Fixed: should be > threshold for mask
 
     postprocess_transforms = Compose([
         FillHoles(),
-        #KeepLargestConnectedComponent(num_components=num_components)
+        # KeepLargestConnectedComponent(num_components=num_components)
     ])
 
     processed_batch = []
@@ -73,8 +78,7 @@ def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5, num_components=1
 
 
 # --- NEW IMPORTS REQUIRED FOR METRICS ---
-from scipy.ndimage import label
-from skimage.measure import marching_cubes, mesh_surface_area
+
 
 def compute_diameters_and_coords(mask, spacing):
     """
@@ -85,7 +89,8 @@ def compute_diameters_and_coords(mask, spacing):
         mask = mask.cpu().numpy()
 
     mask = np.squeeze(mask)
-    spacing = np.array(spacing) # Ensure this is a numpy array for broadcasting!
+    # Ensure this is a numpy array for broadcasting!
+    spacing = np.array(spacing)
 
     COLUMNS = [
         "bdmap_id", "organ",
@@ -129,8 +134,8 @@ def compute_diameters_and_coords(mask, spacing):
         cov = np.cov(centered_coords.T)
 
         eigvals = np.linalg.eigvals(cov)
-        eigvals = np.sort(eigvals)[::-1]  
-        eigvals = np.maximum(eigvals, 1e-8)  
+        eigvals = np.sort(eigvals)[::-1]
+        eigvals = np.maximum(eigvals, 1e-8)
 
         elongation = float(np.sqrt(eigvals[1] / eigvals[0]))
         flatness = float(np.sqrt(eigvals[2] / eigvals[0]))
@@ -141,11 +146,13 @@ def compute_diameters_and_coords(mask, spacing):
     # 6. Standard Surface Area via Marching Cubes
     try:
         padded = np.pad(bin_mask, 1, mode='constant', constant_values=False)
-        verts, faces, normals, values = marching_cubes(padded, level=0.5, spacing=spacing)
+        verts, faces, normals, values = marching_cubes(
+            padded, level=0.5, spacing=spacing)
         surface_area_mm2 = mesh_surface_area(verts, faces)
 
         surface_volume_ratio = float(surface_area_mm2 / volume_mm3)
-        sphericity = float((np.pi ** (1 / 3) * (6 * volume_mm3) ** (2 / 3)) / surface_area_mm2)
+        sphericity = float(
+            (np.pi ** (1 / 3) * (6 * volume_mm3) ** (2 / 3)) / surface_area_mm2)
         sphericity = min(sphericity, 1.0)
 
     except Exception:
@@ -164,6 +171,7 @@ def compute_diameters_and_coords(mask, spacing):
         "max_3d_diameter_mm": max_3d_diameter_mm,
         "num_components": int(num_components)
     }
+
 
 def prepare_conditional_vector(data, device):
     """
@@ -202,13 +210,13 @@ def prepare_conditional_vector(data, device):
     return cond_vector
 
 
-def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3.0, 3.0), norm_stats="dataset_norm_stats.json"):
+def generate_samples(train_data, step, diffusion, cond_scale=2.0, spacing=(3.0, 3.0, 3.0), dims=(48, 48, 48), norm_stats="dataset_norm_stats.json"):
     batch_size = train_data["heatmap"].shape[0]
-    tumor_mask_dims = (batch_size, 1, 64, 64, 64)
+    tumor_mask_dims = (batch_size, 1, *dims)
 
     heatmap = train_data["heatmap"].permute(0, 1, -1, -3, -2).cuda()
     organ_mask_p = train_data["organ_mask"].permute(0, 1, -1, -3, -2).cuda()
-    
+
     tabular_cond = prepare_conditional_vector(train_data, heatmap.device)
     cond = torch.cat([organ_mask_p, heatmap], dim=1)
 
@@ -218,7 +226,8 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3
     # 1. Add no_grad() to prevent memory leaks during inference
     with torch.no_grad():
         for i in tqdm(reversed(range(T_START))):
-            t_i = torch.full((batch_size,), i, device=heatmap.device, dtype=torch.long)
+            t_i = torch.full((batch_size,), i,
+                             device=heatmap.device, dtype=torch.long)
             noisy_latent = diffusion.p_sample(
                 noisy_latent, t_i, cond=cond, tabular_cond=tabular_cond, cond_scale=cond_scale)
 
@@ -227,10 +236,11 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3
 
         # 3. Normalize using the correctly oriented tensor
         recon_normalized = (recon + 1.0) / 2.0
-        
+
     raw_np = recon_normalized.cpu().numpy()
-    
-    tumor_mask = train_data.get("tumor_mask", torch.zeros_like(recon_normalized))
+
+    tumor_mask = train_data.get(
+        "tumor_mask", torch.zeros_like(recon_normalized))
     targets_np = tumor_mask.cpu().numpy().astype(np.uint8)
 
     debug_folder = Path("inference_masks_v2")
@@ -240,11 +250,11 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3
     # Assuming original model outputs 3mm spacing
     base_spacing = spacing
     scale_factor = spacing[0]
-    
+
     # Calculate the new voxel spacing after upsampling
     post_spacing = (
-        base_spacing[0] / scale_factor, 
-        base_spacing[1] / scale_factor, 
+        base_spacing[0] / scale_factor,
+        base_spacing[1] / scale_factor,
         base_spacing[2] / scale_factor
     )
 
@@ -262,7 +272,7 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3
 
     with open(norm_stats, "r") as f:
         normalized_stats = json.load(f)
-        
+
         for b_idx in range(raw_np.shape[0]):
             raw_3d = raw_np[b_idx, 0, :, :, :]
             targ_3d = targets_np[b_idx, 0, :, :, :]
@@ -270,26 +280,30 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3
             # --- POST-PROCESSING ---
             # Pass the raw un-thresholded probabilities into the post-processor
             cleaned_pred_3d = postprocess_tensor(
-                raw_3d, 
-                scale_factor=scale_factor, 
-                threshold=0.5, 
+                raw_3d,
+                scale_factor=scale_factor,
+                threshold=0.5,
                 num_components=1
             )
 
             # Pass the POST_SPACING, not the spatial_shape grid dims
-            metrics = compute_diameters_and_coords(cleaned_pred_3d, post_spacing)
+            metrics = compute_diameters_and_coords(
+                cleaned_pred_3d, post_spacing)
             print(f"\n===== SAMPLE {b_idx+1} =====")
 
             for key in metrics.keys():
                 # Denormalize the requested target condition
                 normalized_conditioner = train_data[key][b_idx].item()
-                target_real_val = (normalized_conditioner * normalized_stats[key]["std"]) + normalized_stats[key]["mean"]
+                target_real_val = (
+                    normalized_conditioner * normalized_stats[key]["std"]) + normalized_stats[key]["mean"]
                 print(f"  {key}:")
                 print(f"    Requested: {target_real_val:.2f}")
                 print(f"    Generated: {metrics[key]:.2f}")
-                print(f"    Delta:     {abs(target_real_val - metrics[key]):.2f}")
+                print(
+                    f"    Delta:     {abs(target_real_val - metrics[key]):.2f}")
 
-                output_metrics.append({"cond_scale":cond_scale,"column_task":train_data["column_task"][b_idx], "column":key,"desired_val":target_real_val,"actual_val":metrics[key]})
+                output_metrics.append({"cond_scale": cond_scale, "column_task": train_data["column_task"][
+                                      b_idx], "column": key, "desired_val": target_real_val, "actual_val": metrics[key]})
 
             print("======================\n")
 
@@ -297,23 +311,24 @@ def generate_samples(train_data,step, diffusion, cond_scale=2.0, spacing=(3.0, 3
             # Save the raw 32x32x32 output with base affine
             nib.save(
                 nib.Nifti1Image(raw_3d, affine=base_affine),
-                str(debug_folder / f"step_stomach_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_RAW.nii.gz")
+                str(debug_folder /
+                    f"step_stomach_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_RAW.nii.gz")
             )
-            
+
             # Save the upscaled and cleaned output with new affine
             nib.save(
                 nib.Nifti1Image(cleaned_pred_3d, affine=new_affine),
-                str(debug_folder / f"step_stomach_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_CLEANED.nii.gz")
+                str(debug_folder /
+                    f"step_stomach_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_CLEANED.nii.gz")
             )
 
     return output_metrics
 
-@hydra.main(config_path='config', config_name='base_cfg', version_base=None)
-def reconstruct(cfg: DictConfig, test_dataset_name="mask_diffusion_train_pro_v5", test_dataset_file="EvaluationSpacedData.csv", model_name="model_best.pt", spacing=(3.0, 3.0, 3.0), output_file="metrics.csv", cond_scales = [1.0, 2.0, 4.0, 6.0], results_folder_name="mask_diffusion_train_pro_v5", norm_stats="dataset_norm_stats.json"):
+
+def reconstruct(cfg, test_dataset_name="multi_tumor_train", test_dataset_file="EvaluationSpacedData.csv", model_name="model_best.pt", dims=(48, 48, 48), spacing=(3.0, 3.0, 3.0), output_file="metrics.csv", cond_scales=[1.0, 2.0, 4.0, 6.0], results_folder_name="mask_diffusion_train_pro_v6", norm_stats="dataset_norm_stats.json"):
     cfg.dataset.datafile = test_dataset_file
     cfg.model.results_folder_postfix = results_folder_name
     cfg.dataset.name = test_dataset_name
-
 
     torch.cuda.set_device(cfg.model.gpus)
     device = torch.device(f"cuda:{cfg.model.gpus}")
@@ -354,21 +369,23 @@ def reconstruct(cfg: DictConfig, test_dataset_name="mask_diffusion_train_pro_v5"
     step = 0
     all_metrics = []
 
-    
-
     for train_data in tqdm(loader_iter):
         print(f"STEP: {step+1}")
         for scale in cond_scales:
-            output_metrics = generate_samples(train_data, step+1, diffusion, cond_scale=scale, spacing=spacing, norm_stats=norm_stats)
+            output_metrics = generate_samples(
+                train_data, step+1, diffusion, cond_scale=scale, spacing=spacing, dims=dims, norm_stats=norm_stats)
             all_metrics.extend(output_metrics)
         print(all_metrics)
         print("================")
 
         step += 1
-    
+
     metrics_df = pd.DataFrame(all_metrics)
-    metrics_df.to_csv(output_file,index=False)
+    metrics_df.to_csv(output_file, index=False)
 
 
 if __name__ == '__main__':
-    reconstruct(test_dataset_file="AAProTrain.csv", spacing=(2.0, 2.0, 2.0), output_file="metrics.csv", cond_scales = [1.0, 2.0, 4.0, 6.0])
+    initialize(version_base=None, config_path="config")
+    cfg = compose(config_name="base_cfg")
+    reconstruct(cfg, test_dataset_file="EvaluationSpacedData.csv", spacing=(3.0, 3.0, 3.0),
+                output_file="metrics.csv", dims=(48, 48, 48), cond_scales=[1.0, 2.0, 4.0, 6.0])

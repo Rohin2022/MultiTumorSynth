@@ -1,7 +1,7 @@
 import pandas as pd
 
 
-all_data = pd.read_csv("RadiomicsMaskMetricsBadDropped.csv")
+all_data = pd.read_csv("mask_metrics_v7.csv")
 swiss = pd.read_csv("/projects/bodymaps/Data/metadata_swiss.csv")
 turkish = pd.read_csv("/projects/bodymaps/Data/turkish_dataset_meta_latest.csv")
 

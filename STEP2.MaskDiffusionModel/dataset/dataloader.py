@@ -441,6 +441,11 @@ def get_loader(args):
         train_input = train_input[train_input["diameter_y_mm"]<(args.roi_y*args.space_y)]
         train_input = train_input[train_input["diameter_z_mm"]<(args.roi_z*args.space_z)]
 
+        train_input = train_input[
+            (train_input["diameter_x_mm"] >= args.space_x) & 
+            (train_input["diameter_y_mm"] >= args.space_y) & 
+            (train_input["diameter_z_mm"] >= args.space_z)
+        ]
 
         # 2. CALCULATE WEIGHTS FIRST (While volume_ml is still in true mL)
         vol_cutoff = float(train_input['volume_ml'].quantile(0.98))
@@ -470,7 +475,7 @@ def get_loader(args):
 
         stats_file = "dataset_norm_stats.json"
         exclude_cols = ['volume_bin', 'sample_weight', 'organ',
-                        'tumor_mask', 'organ_mask', 'capped_volume', 'column_task']
+                        'tumor_mask', 'organ_mask', 'capped_volume', 'column_task','diameter_x_mm','diameter_y_mm','diameter_z_mm']
 
         if os.path.exists(stats_file):
             print("Loading existing normalization statistics...")
@@ -502,9 +507,6 @@ def get_loader(args):
         data_dicts_train = train_input.to_dict("records")
         print('train len {}'.format(len(data_dicts_train)))
 
-        persistent_cache_dir = os.path.join(
-            args.data_root_path, "monai_persistent_cache")
-        os.makedirs(persistent_cache_dir, exist_ok=True)
 
         train_dataset = Dataset(
             data=data_dicts_train, transform=train_transforms)

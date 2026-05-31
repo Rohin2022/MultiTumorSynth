@@ -1,5 +1,5 @@
 from dataset.dataloader import get_loader
-from ddpm.unet import UNet
+#from ddpm.unet import UNet
 import os
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -7,7 +7,7 @@ import hydra
 from ddpm import Unet3D, GaussianDiffusion, Trainer
 from re import I
 import sys
-import os
+
 sys.path.append(os.getcwd())
 
 
@@ -38,11 +38,22 @@ def run(cfg: DictConfig):
         num_frames=cfg.model.diffusion_depth_size,
         channels=cfg.model.diffusion_num_channels,
         timesteps=cfg.model.timesteps,
-        loss_type=cfg.model.loss_type
+        loss_type=cfg.model.loss_type,
+        dice_weight=cfg.model.dice_weight
     ).cuda()
 
+
     train_dataloader, train_sampler, dataset_size = get_loader(cfg.dataset)
+    
     val_dataloader = None
+
+
+    PRECISION_MAP = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    precision = PRECISION_MAP[cfg.model.precision]
 
     trainer = Trainer(
         diffusion,
@@ -55,6 +66,7 @@ def run(cfg: DictConfig):
         gradient_accumulate_every=cfg.model.gradient_accumulate_every,
         ema_decay=cfg.model.ema_decay,
         amp=cfg.model.amp,
+        precision=precision,
         num_sample_rows=cfg.model.num_sample_rows,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,

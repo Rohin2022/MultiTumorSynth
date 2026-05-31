@@ -1,3 +1,9 @@
+from skimage.measure import marching_cubes, mesh_surface_area
+from scipy.ndimage import label
+import json
+from torch.utils.tensorboard import SummaryWriter
+from torch.cuda.amp import GradScaler, autocast
+import torch.nn as nn
 import os
 from tensorboardX import SummaryWriter
 import math
@@ -24,6 +30,8 @@ from rotary_embedding_torch import RotaryEmbedding
 from torch.utils.data import Dataset, DataLoader
 
 import matplotlib.pyplot as plt
+
+from monai.losses import DiceLoss
 
 
 def exists(x):
@@ -625,6 +633,7 @@ class GaussianDiffusion(nn.Module):
         channels=3,
         timesteps=1000,
         loss_type='l1',
+        dice_weight=0.01,
         use_dynamic_thres=False,
         dynamic_thres_percentile=0.9,
     ):
@@ -687,6 +696,10 @@ class GaussianDiffusion(nn.Module):
 
         self.use_dynamic_thres = use_dynamic_thres
         self.dynamic_thres_percentile = dynamic_thres_percentile
+
+        if(self.loss_type=="l2/Dice"):
+            self.dice_criterion = DiceLoss(sigmoid=False, reduction='none', batch=False)
+            self.dice_weight = dice_weight
 
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -799,10 +812,52 @@ class GaussianDiffusion(nn.Module):
             loss = F.l1_loss(noise, x_recon)
         elif self.loss_type == 'l2':
             loss = F.mse_loss(noise, x_recon)
-        else:
-            raise NotImplementedError()
+        elif self.loss_type == 'l2/Dice':
+            mse_loss = F.mse_loss(noise, x_recon)
 
-        return loss
+            # Recover predicted x0 from noise prediction
+            x0_pred = self.predict_start_from_noise(x_noisy, t=t, noise=x_recon)
+            x0_pred = x0_pred.clamp(-1, 1)          # match clip_denoised behavior
+            x0_pred_01 = (x0_pred + 1) / 2          # now guaranteed [0, 1]
+            x_start_01 = (x_start + 1) / 2          # exactly {0, 1}
+
+            t_frac = t.float() / self.num_timesteps          
+            dice_weight = self.dice_weight * (1.0 - t_frac)
+
+            dice_per_sample = self.dice_criterion(x0_pred_01, x_start_01)  
+            dice_per_sample = dice_per_sample.view(b)
+
+            dice_loss_weighted = (dice_weight * dice_per_sample).mean()
+            loss = mse_loss + dice_loss_weighted
+
+            # --- BUCKETED LOGGING LOGIC ---
+            metrics = {
+                "mse_loss": mse_loss.item(),
+                "dice_loss_global": dice_loss_weighted.item(),
+                "dice_raw_mean_global": dice_per_sample.mean().item()
+            }
+
+            # Define your bucket boundaries (e.g., 4 bins: [0-250), [250-500), [500-750), [750-1000])
+            num_buckets = 4
+            bucket_size = self.num_timesteps // num_buckets
+            
+            for bucket_idx in range(num_buckets):
+                low = bucket_idx * bucket_size
+                high = (bucket_idx + 1) * bucket_size
+                
+                # Create a mask for samples belonging to this specific timestep bucket
+                mask = (t >= low) & (t < high)
+                
+                # Check if any samples in the current batch fell into this bucket
+                if mask.any():
+                    # Calculate unweighted raw dice for monitoring structural quality in this bucket
+                    metrics[f"dice_raw_bucket_{low}_{high}"] = dice_per_sample[mask].mean().item()
+
+            # ------------------------------
+
+            return loss, metrics
+        
+        return loss, {"loss":loss}
 
     def forward(self, heatmap, tumor_mask, organ_mask, tabular_cond, null_cond_prob=0.0, *args, **kwargs):
         # 1. Permute all inputs for 3D processing (B, C, D, H, W)
@@ -841,22 +896,8 @@ def unnormalize_img(t):
     return (t + 1) * 0.5
 
 
-import os
-import copy
-from pathlib import Path
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import Adam
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.tensorboard import SummaryWriter
-import nibabel as nib
-import json
-
 # --- NEW IMPORTS REQUIRED FOR METRICS ---
-from scipy.ndimage import label
-from skimage.measure import marching_cubes, mesh_surface_area
+
 
 def compute_diameters_and_coords(mask, spacing):
     """
@@ -867,11 +908,12 @@ def compute_diameters_and_coords(mask, spacing):
         mask = mask.cpu().numpy()
 
     mask = np.squeeze(mask)
-    spacing = np.array(spacing) # Ensure this is a numpy array for broadcasting!
+    # Ensure this is a numpy array for broadcasting!
+    spacing = np.array(spacing)
 
     COLUMNS = [
         "bdmap_id", "organ",
-        "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
+        "major_axis_mm", "minor_axis_mm", "least_axis_mm",
         "volume_ml",
         "sphericity", "surface_volume_ratio",
         "elongation", "flatness", "max_3d_diameter_mm",
@@ -911,8 +953,8 @@ def compute_diameters_and_coords(mask, spacing):
         cov = np.cov(centered_coords.T)
 
         eigvals = np.linalg.eigvals(cov)
-        eigvals = np.sort(eigvals)[::-1]  
-        eigvals = np.maximum(eigvals, 1e-8)  
+        eigvals = np.sort(eigvals)[::-1]
+        eigvals = np.maximum(eigvals, 1e-8)
 
         elongation = float(np.sqrt(eigvals[1] / eigvals[0]))
         flatness = float(np.sqrt(eigvals[2] / eigvals[0]))
@@ -923,11 +965,13 @@ def compute_diameters_and_coords(mask, spacing):
     # 6. Standard Surface Area via Marching Cubes
     try:
         padded = np.pad(bin_mask, 1, mode='constant', constant_values=False)
-        verts, faces, normals, values = marching_cubes(padded, level=0.5, spacing=spacing)
+        verts, faces, normals, values = marching_cubes(
+            padded, level=0.5, spacing=spacing)
         surface_area_mm2 = mesh_surface_area(verts, faces)
 
         surface_volume_ratio = float(surface_area_mm2 / volume_mm3)
-        sphericity = float((np.pi ** (1 / 3) * (6 * volume_mm3) ** (2 / 3)) / surface_area_mm2)
+        sphericity = float(
+            (np.pi ** (1 / 3) * (6 * volume_mm3) ** (2 / 3)) / surface_area_mm2)
         sphericity = min(sphericity, 1.0)
 
     except Exception:
@@ -935,9 +979,9 @@ def compute_diameters_and_coords(mask, spacing):
         surface_volume_ratio, sphericity = 0.0, 0.0
 
     return {
-        "diameter_x_mm": max_x,
-        "diameter_y_mm": max_y,
-        "diameter_z_mm": max_z,
+        "major_axis_mm": max_x,
+        "minor_axis_mm": max_y,
+        "least_axis_mm": max_z,
         "volume_ml": volume_ml,
         "sphericity": sphericity,
         "surface_volume_ratio": surface_volume_ratio,
@@ -966,6 +1010,7 @@ class Trainer(object):
         train_num_steps=100000,
         gradient_accumulate_every=2,
         amp=False,
+        precision=torch.bfloat16,
         step_start_ema=2000,
         update_ema_every=10,
         save_and_sample_every=1000,
@@ -999,7 +1044,10 @@ class Trainer(object):
         self.step = 0
 
         self.amp = amp
-        self.scaler = GradScaler(enabled=amp)
+        self.precision = precision
+        self.scaler = GradScaler(
+            enabled=amp and (precision is not torch.bfloat16) # only use grad scaler for fp16
+        )
         self.max_grad_norm = max_grad_norm
 
         self.num_sample_rows = num_sample_rows
@@ -1055,7 +1103,7 @@ class Trainer(object):
         Output shape: (Batch, 19) -> 9 organ classes + 10 numerical features
         """
         numerical_features = [
-            "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
+            "major_axis_mm", "minor_axis_mm", "least_axis_mm",
             "volume_ml",
             "sphericity", "surface_volume_ratio",
             "elongation", "flatness", "max_3d_diameter_mm",
@@ -1106,12 +1154,12 @@ class Trainer(object):
 
                 tabular_cond = self.prepare_conditional_vector(
                     data, device=device)
-                with autocast(enabled=self.amp):
-                    loss = self.model(
-                        heatmap=heatmap,
-                        tumor_mask=tumor_mask,                    # Target for diffusion!
-                        organ_mask=organ_mask,                    # Condition
-                        tabular_cond=tabular_cond,  # Condition
+                with autocast(enabled=self.amp, dtype=self.precision):
+                    loss, loss_dict = self.model(
+                        tumor_mask=tumor_mask,                      # Target for diffusion
+                        heatmap=heatmap,                           # Condition
+                        organ_mask=organ_mask,                      # Condition
+                        tabular_cond=tabular_cond,     # Condition
                         prob_focus_present=prob_focus_present,
                         focus_present_mask=focus_present_mask,
                         null_cond_prob=0.1
@@ -1120,10 +1168,7 @@ class Trainer(object):
                     self.scaler.scale(
                         loss / self.gradient_accumulate_every).backward()
 
-                if (self.step % 10 == 0):
-                    print(f'{self.step}: {loss.item()}')
 
-            log = {'loss': loss.item()}
 
             if exists(self.max_grad_norm):
                 self.scaler.unscale_(self.opt)
@@ -1138,6 +1183,23 @@ class Trainer(object):
             self.writer.add_scalar('Train_Loss', loss.item(), self.step)
             self.writer.add_scalar('Learning_rate', lr, self.step)
 
+
+            if(self.cfg.model.loss_type=='l2/Dice'):
+                for metric in loss_dict.keys():
+                    self.writer.add_scalar(metric,loss_dict[metric], self.step)
+
+                    
+                if (self.step % 50 == 0):
+                    print(f'{self.step}: Loss = {loss.item()}')
+                    
+            else:
+                loss_val = loss_dict["loss"].item()
+                self.writer.add_scalar('Loss', loss_val, self.step)
+                    
+                if (self.step % 50 == 0):
+                    print(f'{self.step}: MSE: {loss_val}')
+
+
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every
                 self.save(milestone)  # Save the periodic checkpoint
@@ -1150,7 +1212,6 @@ class Trainer(object):
 
             if self.step > 0 and self.step % self.update_ema_every == 0:
                 self.step_ema()
-
 
             # ==========================================
             # 3. DEBUG: GENERATE AND SAVE NIFTI MASKS
@@ -1211,30 +1272,38 @@ class Trainer(object):
 
                                 metrics = compute_diameters_and_coords(
                                     pred_3d, (self.space_x, self.space_y, self.space_z))
+
+                                volume_delta = "unknown"
+                                volume = ""
+
+                                print("===============================")
                                 
-                                volume_delta="unknown"
-                                volume=""
+                                print(f"PREDS: Step: {self.step} Sample: {b_idx}")
                                 for key in metrics.keys():
-                                    unnormalized_conditioner = data[key][b_idx].item() * normalized_stats[key]["std"] + normalized_stats[key]["mean"]
-                                    print(f"SAMPLE 1: \n {key}: \ndelta = {abs(unnormalized_conditioner-metrics[key])}\n")
-                                    print("================")
-                                    if(key=="volume_ml"):
-                                        volume_delta = abs(unnormalized_conditioner-metrics[key])
+                                    unnormalized_conditioner = data[key][b_idx].item(
+                                    ) * normalized_stats[key]["std"] + normalized_stats[key]["mean"]
+                                    print(
+                                        f"{key}: \ndelta = {abs(unnormalized_conditioner-metrics[key])}\n")
+                                    if (key == "volume_ml"):
+                                        volume_delta = abs(
+                                            unnormalized_conditioner-metrics[key])
                                         volume = metrics[key]
+
+                                print("===============================")
 
                                 nib.save(
                                     nib.Nifti1Image(pred_3d, affine=affine),
                                     str(debug_folder /
-                                        f"step_{self.step}_sample_{b_idx}_RECON_{volume}_{volume_delta}.nii.gz")
+                                        f"step_{self.step}_sample_{b_idx}_RECON.nii.gz")
                                 )
                                 nib.save(
                                     nib.Nifti1Image(raw_3d, affine=affine),
                                     str(debug_folder /
-                                        f"step_{self.step}_sample_{b_idx}_RAW_RECON_{volume}_{volume_delta}.nii.gz")
-                                )   
+                                        f"step_{self.step}_sample_{b_idx}_RAW_RECON.nii.gz")
+                                )
                 self.ema_model.train()
 
-            log_fn(log)
+            
             self.step += 1
         print('training completed')
 
