@@ -33,7 +33,7 @@ def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5, num_components=1
             align_corners=False
         )
 
-    binary_mask = (tensor_mask < threshold).to(torch.uint8)
+    binary_mask = (tensor_mask <= threshold).to(torch.uint8)
 
     postprocess_transforms = Compose([
         FillHoles(),

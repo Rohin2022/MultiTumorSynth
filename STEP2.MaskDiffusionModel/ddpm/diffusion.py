@@ -8,6 +8,7 @@ import os
 from tensorboardX import SummaryWriter
 import math
 import copy
+from .ddim import DDIMSampler
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -857,7 +858,7 @@ class GaussianDiffusion(nn.Module):
 
             return loss, metrics
         
-        return loss, {"loss":loss}
+        return loss, {"loss":loss.item()}
 
     def forward(self, heatmap, tumor_mask, organ_mask, tabular_cond, null_cond_prob=0.0, *args, **kwargs):
         # 1. Permute all inputs for 3D processing (B, C, D, H, W)
@@ -1193,11 +1194,11 @@ class Trainer(object):
                     print(f'{self.step}: Loss = {loss.item()}')
                     
             else:
-                loss_val = loss_dict["loss"].item()
+                loss_val = loss_dict["loss"]
                 self.writer.add_scalar('Loss', loss_val, self.step)
                     
                 if (self.step % 50 == 0):
-                    print(f'{self.step}: MSE: {loss_val}')
+                    print(f'{self.step}: Loss = {loss_val}')
 
 
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
@@ -1250,7 +1251,7 @@ class Trainer(object):
                     recon_normalized = (recon + 1.0) / 2.0
 
                     # 7. Threshold back to binary
-                    generated_masks = (recon_normalized < 0.5).float()
+                    generated_masks = (recon_normalized <= 0.5).float()
 
                     masks_np = generated_masks.cpu().numpy().astype(np.uint8)
                     raw_np = recon_normalized.cpu().numpy()

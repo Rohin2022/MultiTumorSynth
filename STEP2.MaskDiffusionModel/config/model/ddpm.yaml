@@ -5,7 +5,7 @@ diffusion_num_channels: 3
 out_dim: 1
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/
-results_folder_postfix: 'mask_diffusion_train_pro_v7'
+results_folder_postfix: 'mask_diffusion_train_pro_v8'
 load_milestone: False
 
 batch_size: 12 # 40
@@ -15,11 +15,11 @@ objective: pred_x0
 save_and_sample_every: 5000
 denoising_fn: Unet3D
 train_lr: 1e-4
-timesteps: 200 # number of steps
+timesteps: 1000 # number of steps
 sampling_timesteps: 200 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
-loss_type: l2/Dice # l1 or l2 or l2/Dice
+loss_type: l1 # l1 or l2 or l2/Dice
 dice_weight: 0.5
-train_num_steps: 40000 # total training steps
+train_num_steps: 30000 # total training steps
 gradient_accumulate_every: 1 # gradient accumulation steps
 ema_decay: 0.995 # exponential moving average decay
 amp: True # turn on mixed precision

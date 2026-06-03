@@ -223,57 +223,64 @@ class Compose_Select(Compose):
                 _transform, input_, self.map_items, self.unpack_items, self.log_stats)
         return input_
 
-
-class GenerateTumorHeatmapd(MapTransform):
+class GenerateBoundingBoxPrior(MapTransform):
     """
-    Calculates the center of mass of a binary mask and generates a 3D 
-    Gaussian heatmap centered on that point.
+    Generates a 3D anisotropic Gaussian (ellipsoid) prior centered at the centroid.
+    Uses diameter_x, y, z_mm to scale the spread along each axis.
     """
 
-    def __init__(self, ref_key="tumor_mask", out_key="heatmap", sigma=5.0, allow_missing_keys=False):
-        super().__init__([ref_key], allow_missing_keys)
+    def __init__(self, ref_key="tumor_mask", out_key="heatmap", 
+                 diameters=["diameter_x_mm", "diameter_y_mm", "diameter_z_mm"], 
+                 allow_missing_keys=False, spacing=(3.0,3.0,3.0)):
+        super().__init__([ref_key] + diameters, allow_missing_keys)
         self.ref_key = ref_key
+        self.diameters = diameters
         self.out_key = out_key
-        self.sigma = sigma  # Controls how "wide" the target region is
+        self.spacing = spacing
 
     def __call__(self, data):
         d = dict(data)
         mask = d[self.ref_key]
-
-        # Ensure it's a tensor for fast math
-        mask_tensor = mask if isinstance(
-            mask, torch.Tensor) else torch.tensor(mask)
-
-        # Assuming shape is [Channel, X, Y, Z]
+        
+        mask_tensor = mask if isinstance(mask, torch.Tensor) else torch.tensor(mask)
         binary_mask = (mask_tensor[0] > 0).float()
         indices = torch.nonzero(binary_mask)
 
         if len(indices) == 0:
-            # Fallback if no tumor is present (blank heatmap)
-            heatmap = torch.zeros_like(mask_tensor)
-        else:
-            # 1. Get exact X, Y, Z centroid
-            centroid = indices.float().mean(dim=0)
-            #print(f"CENTROID: {centroid}")
+            d[self.out_key] = torch.zeros_like(mask_tensor)
+            return d
 
-            # 2. Generate 3D grid
-            X, Y, Z = binary_mask.shape
-            x_grid, y_grid, z_grid = torch.meshgrid(
-                torch.arange(X, device=mask_tensor.device),
-                torch.arange(Y, device=mask_tensor.device),
-                torch.arange(Z, device=mask_tensor.device),
-                indexing='ij'
-            )
+        # 1. Calculate Centroid
+        centroid = indices.float().mean(dim=0)
 
-            # 3. Calculate Gaussian distance
-            dist_sq = (x_grid - centroid[0])**2 + (y_grid -
-                                                   centroid[1])**2 + (z_grid - centroid[2])**2
-            heatmap = torch.exp(-dist_sq / (2 * self.sigma**2))
+        # 2. Calculate Sigmas from Diameters (convert mm to voxels)
+        # Assuming diameter = 4 * sigma (~95% of mass inside diameter)
+        # sigmas[i] = (diameter_mm[i] / spacing[i]) / 4
+        sigmas = []
+        for i, key in enumerate(self.diameters):
+            diam_mm = d[key]
+            sigma = (diam_mm / self.spacing[i]) / 4.0
+            # Ensure sigma isn't zero to avoid division issues
+            sigmas.append(max(sigma, 0.5)) 
 
-            # Add channel dimension back -> [1, X, Y, Z]
-            heatmap = heatmap.unsqueeze(0)
+        # 3. Generate 3D grid
+        X, Y, Z = binary_mask.shape
+        x_grid, y_grid, z_grid = torch.meshgrid(
+            torch.arange(X, device=mask_tensor.device),
+            torch.arange(Y, device=mask_tensor.device),
+            torch.arange(Z, device=mask_tensor.device),
+            indexing='ij'
+        )
 
-        d[self.out_key] = heatmap
+        # 4. Calculate Anisotropic Gaussian Distance
+        # G(x,y,z) = exp( - [ (x-cx)^2 / 2sx^2 + (y-cy)^2 / 2sy^2 + (z-cz)^2 / 2sz^2 ] )
+        dist_sq = ((x_grid - centroid[0])**2 / (2 * sigmas[0]**2)) + \
+                  ((y_grid - centroid[1])**2 / (2 * sigmas[1]**2)) + \
+                  ((z_grid - centroid[2])**2 / (2 * sigmas[2]**2))
+        
+        ellipsoid = torch.exp(-dist_sq)
+        d[self.out_key] = ellipsoid.unsqueeze(0)
+
         return d
 
 
@@ -299,8 +306,8 @@ def get_loader(args):
 
             # 3. GENERATE THE HEATMAP BEFORE CROPPING
             # You can adjust sigma. 5.0 means the "hotspot" radius is roughly 10-15 voxels wide
-            GenerateTumorHeatmapd(ref_key="tumor_mask",
-                                  out_key="heatmap", sigma=8.0),
+            GenerateBoundingBoxPrior(ref_key="tumor_mask",
+                                  out_key="heatmap", spacing=(args.space_x, args.space_y, args.space_z)),
 
             # 4. Crop and Augment (Heatmap gets sliced exactly like the masks)
             RandCropByLabelClassesd(
@@ -352,11 +359,8 @@ def get_loader(args):
             ),
 
             # Generates the heatmap on the newly cropped, smaller volume.
-            GenerateTumorHeatmapd(
-                ref_key="tumor_mask",
-                out_key="heatmap", 
-                sigma=8.0
-            ),
+            GenerateBoundingBoxPrior(ref_key="tumor_mask",
+                                  out_key="heatmap", spacing=(args.space_x, args.space_y, args.space_z)),
 
             # 2. CROP FOREGROUND FIRST 
             # Cut away the empty background before doing heavy math.
@@ -419,6 +423,22 @@ def get_loader(args):
                 row["bdmap_id"]), "segmentations", f"{parseOrganName(row['organ'])}.nii.gz"),
             axis=1
         )
+
+
+        # Verify that all paths exist
+        from pathlib import Path
+
+        tumor = train_input["tumor_mask"].values
+        organ = train_input["organ_mask"].values
+
+        tumor_ok = [Path(p).exists() for p in tumor]
+        organ_ok = [Path(p).exists() for p in organ]
+
+        mask = [t and o for t, o in zip(tumor_ok, organ_ok)]
+
+        train_input = train_input.loc[mask].reset_index(drop=True)
+
+
 
         organ_mapping = {
             'spleen': 0,
@@ -505,6 +525,8 @@ def get_loader(args):
 
         # 5. CONVERT TO DICTIONARY RECORDS FOR MONAI
         data_dicts_train = train_input.to_dict("records")
+
+        #data_dicts_train = data_dicts_train[:10]
         print('train len {}'.format(len(data_dicts_train)))
 
 

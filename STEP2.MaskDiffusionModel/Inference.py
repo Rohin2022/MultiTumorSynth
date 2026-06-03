@@ -1,27 +1,57 @@
-from skimage.measure import marching_cubes, mesh_surface_area
-from scipy.ndimage import label
-from dataset.dataloader import get_loader
-import numpy as np
-import nibabel as nib
-import torch.nn.functional as F
-import pandas as pd
-import torch
-from omegaconf import DictConfig, open_dict
-from hydra import initialize, compose
 import os
-from ddpm import Unet3D, GaussianDiffusion
-from pathlib import Path
-from tqdm import tqdm
-import json
-
-# Add MONAI imports for post-processing
-from monai.transforms import FillHoles, KeepLargestConnectedComponent, Compose
-
 import sys
+from pathlib import Path
+import json
+import numpy as np
+import pandas as pd
+import nibabel as nib
+from tqdm import tqdm
+import multiprocessing
+
+import torch
+import torch.nn.functional as F
+from omegaconf import open_dict
+from hydra import initialize, compose
+
+# MONAI imports
+from monai.transforms import FillHoles, Compose
+
+# Custom local imports
+from dataset.dataloader import get_loader
+from ddpm import Unet3D, GaussianDiffusion
+from ddpm import DDIMSampler 
+from metrics import RadiomicsMetricsEvaluator
+
 sys.path.append(os.getcwd())
 
 
-def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5, num_components=1):
+def process_radiomics_worker(task_data):
+    """
+    Top-level worker function for multiprocessing pyradiomics evaluation.
+    Instantiates the evaluator locally to ensure process safety.
+    """
+    evaluator = RadiomicsMetricsEvaluator()
+    
+    cleaned_pred_3d = task_data["cleaned_pred_3d"]
+    post_spacing = task_data["post_spacing"]
+    
+    # --- METRICS EXTRACTION ---
+    metrics = evaluator.compute(cleaned_pred_3d, post_spacing)
+    
+    results = []
+    for key, target_real_val in task_data["target_vals"].items():
+        results.append({
+            "cond_scale": task_data["cond_scale"], 
+            "column_task": task_data["column_task"], 
+            "column": key, 
+            "desired_val": target_real_val, 
+            "actual_val": metrics.get(key, np.nan)
+        })
+        
+    return results
+
+
+def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5):
     """
     Handles both (X, Y, Z) and (B, X, Y, Z) formats with NO channel dimension.
     Accepts both PyTorch Tensors and NumPy arrays.
@@ -44,19 +74,13 @@ def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5, num_components=1
     tensor_mask = tensor_mask.unsqueeze(1)
 
     if scale_factor != 1:
-        tensor_mask = F.interpolate(
-            tensor_mask,
-            scale_factor=scale_factor,
-            mode='trilinear',
-            align_corners=False
-        )
+        pass
 
-    binary_mask = (tensor_mask < threshold).to(
-        torch.uint8)  # Fixed: should be > threshold for mask
+    binary_mask = (tensor_mask <= threshold).to(torch.uint8)
 
     postprocess_transforms = Compose([
         FillHoles(),
-        # KeepLargestConnectedComponent(num_components=num_components)
+        # KeepLargestConnectedComponent(num_components=num_components) 
     ])
 
     processed_batch = []
@@ -77,111 +101,14 @@ def postprocess_tensor(raw_mask, scale_factor=3, threshold=0.5, num_components=1
     return final_tensor
 
 
-# --- NEW IMPORTS REQUIRED FOR METRICS ---
-
-
-def compute_diameters_and_coords(mask, spacing):
-    """
-    Computes volume, diameters, PCA-based elongation/flatness, and 
-    marching-cubes-based sphericity for the given 3D mask.
-    """
-    if hasattr(mask, "numpy"):
-        mask = mask.cpu().numpy()
-
-    mask = np.squeeze(mask)
-    # Ensure this is a numpy array for broadcasting!
-    spacing = np.array(spacing)
-
-    COLUMNS = [
-        "bdmap_id", "organ",
-        "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
-        "volume_ml",
-        "sphericity", "surface_volume_ratio",
-        "elongation", "flatness", "max_3d_diameter_mm",
-        "num_components"
-    ]
-
-    zeros = {col: 0.0 for col in COLUMNS if col not in ["bdmap_id", "organ"]}
-    zeros["num_components"] = 0
-
-    bin_mask = mask > 0
-    if not bin_mask.any():
-        return zeros
-
-    # 1. Connected Components Tracking
-    structure = np.ones((3, 3, 3), dtype=bool)
-    _, num_components = label(bin_mask, structure=structure)
-
-    # 2. Extract Physical Coordinates for All Voxels
-    coords = np.argwhere(bin_mask)
-    coords_mm = coords * spacing  # Vectorized conversion to physical space
-
-    # 3. Axis-Aligned Box Diameters
-    min_coords = coords_mm.min(axis=0)
-    max_coords = coords_mm.max(axis=0)
-    # Adding 1 single voxel width to accurately reflect physical boundary span
-    diameters = max_coords - min_coords + spacing
-    max_x, max_y, max_z = diameters[0], diameters[1], diameters[2]
-
-    # 4. Volume
-    voxel_volume_mm3 = spacing[0] * spacing[1] * spacing[2]
-    volume_mm3 = len(coords_mm) * voxel_volume_mm3
-    volume_ml = volume_mm3 / 1000.0
-
-    # 5. Fast Principle Component Analysis (PCA)
-    try:
-        centered_coords = coords_mm - coords_mm.mean(axis=0)
-        cov = np.cov(centered_coords.T)
-
-        eigvals = np.linalg.eigvals(cov)
-        eigvals = np.sort(eigvals)[::-1]
-        eigvals = np.maximum(eigvals, 1e-8)
-
-        elongation = float(np.sqrt(eigvals[1] / eigvals[0]))
-        flatness = float(np.sqrt(eigvals[2] / eigvals[0]))
-        max_3d_diameter_mm = float(4.0 * np.sqrt(eigvals[0]))
-    except Exception:
-        elongation, flatness, max_3d_diameter_mm = 0.0, 0.0, 0.0
-
-    # 6. Standard Surface Area via Marching Cubes
-    try:
-        padded = np.pad(bin_mask, 1, mode='constant', constant_values=False)
-        verts, faces, normals, values = marching_cubes(
-            padded, level=0.5, spacing=spacing)
-        surface_area_mm2 = mesh_surface_area(verts, faces)
-
-        surface_volume_ratio = float(surface_area_mm2 / volume_mm3)
-        sphericity = float(
-            (np.pi ** (1 / 3) * (6 * volume_mm3) ** (2 / 3)) / surface_area_mm2)
-        sphericity = min(sphericity, 1.0)
-
-    except Exception:
-        # Failsafe for degenerate shapes (e.g., flat 2D slices that cannot be meshed)
-        surface_volume_ratio, sphericity = 0.0, 0.0
-
-    return {
-        "diameter_x_mm": max_x,
-        "diameter_y_mm": max_y,
-        "diameter_z_mm": max_z,
-        "volume_ml": volume_ml,
-        "sphericity": sphericity,
-        "surface_volume_ratio": surface_volume_ratio,
-        "elongation": elongation,
-        "flatness": flatness,
-        "max_3d_diameter_mm": max_3d_diameter_mm,
-        "num_components": int(num_components)
-    }
-
-
 def prepare_conditional_vector(data, device):
     """
-    Extracts tabular features into a single tensor, one-hot encoding the organ.
+    Extracts tabular features into a single tensor.
     Output shape: (Batch, 19) -> 9 organ classes + 10 numerical features
     """
     numerical_features = [
-        "diameter_x_mm", "diameter_y_mm", "diameter_z_mm",
-        "volume_ml",
-        "sphericity", "surface_volume_ratio",
+        "major_axis_mm", "minor_axis_mm", "least_axis_mm",
+        "volume_ml", "sphericity", "surface_volume_ratio",
         "elongation", "flatness", "max_3d_diameter_mm",
         "num_components"
     ]
@@ -210,9 +137,11 @@ def prepare_conditional_vector(data, device):
     return cond_vector
 
 
-def generate_samples(train_data, step, diffusion, cond_scale=2.0, spacing=(3.0, 3.0, 3.0), dims=(48, 48, 48), norm_stats="dataset_norm_stats.json"):
+def generate_samples(train_data, step, diffusion, cond_scale=2.0, ddim_steps=50, use_ddpm=False, spacing=(3.0, 3.0, 3.0), dims=(48, 48, 48), norm_stats="dataset_norm_stats.json", save_raw=False):
     batch_size = train_data["heatmap"].shape[0]
-    tumor_mask_dims = (batch_size, 1, *dims)
+    
+    # Define generation shape: (Channels, D, H, W)
+    shape = (1, *dims)
 
     heatmap = train_data["heatmap"].permute(0, 1, -1, -3, -2).cuda()
     organ_mask_p = train_data["organ_mask"].permute(0, 1, -1, -3, -2).cuda()
@@ -220,38 +149,53 @@ def generate_samples(train_data, step, diffusion, cond_scale=2.0, spacing=(3.0, 
     tabular_cond = prepare_conditional_vector(train_data, heatmap.device)
     cond = torch.cat([organ_mask_p, heatmap], dim=1)
 
-    T_START = 1000
-    noisy_latent = torch.randn(tumor_mask_dims).cuda()
+    noisy_latent = torch.randn((batch_size, *shape)).cuda()
 
-    # 1. Add no_grad() to prevent memory leaks during inference
     with torch.no_grad():
-        for i in tqdm(reversed(range(T_START))):
-            t_i = torch.full((batch_size,), i,
-                             device=heatmap.device, dtype=torch.long)
-            noisy_latent = diffusion.p_sample(
-                noisy_latent, t_i, cond=cond, tabular_cond=tabular_cond, cond_scale=cond_scale)
+        if use_ddpm:
+            # --- STANDARD DDPM SAMPLING ---
+            T_START = diffusion.num_timesteps
+            for i in tqdm(reversed(range(T_START)), desc="DDPM Sampling", total=T_START, leave=False):
+                t_i = torch.full((batch_size,), i, device=heatmap.device, dtype=torch.long)
+                noisy_latent = diffusion.p_sample(
+                    noisy_latent, 
+                    t_i, 
+                    cond=cond, 
+                    tabular_cond=tabular_cond, 
+                    cond_scale=cond_scale
+                )
+            recon_latent = noisy_latent
+        else:
+            # --- FAST DDIM SAMPLING ---
+            ddim_sampler = DDIMSampler(diffusion)
+            recon_latent, _ = ddim_sampler.sample(
+                S=ddim_steps,
+                batch_size=batch_size,
+                shape=shape,
+                conditioning=cond,
+                tabular_cond=tabular_cond,
+                unconditional_guidance_scale=cond_scale,
+                x_T=noisy_latent,
+                eta=0.0  # Pure deterministic DDIM
+            )
 
-        # 2. Reverse the permutation to restore original spatial dimensions!
-        recon = noisy_latent.permute(0, 1, -2, -1, -3)
+        # Reverse the permutation to restore original spatial dimensions!
+        recon = recon_latent.permute(0, 1, -2, -1, -3)
 
-        # 3. Normalize using the correctly oriented tensor
+        # Normalize using the correctly oriented tensor
         recon_normalized = (recon + 1.0) / 2.0
 
     raw_np = recon_normalized.cpu().numpy()
 
-    tumor_mask = train_data.get(
-        "tumor_mask", torch.zeros_like(recon_normalized))
+    tumor_mask = train_data.get("tumor_mask", torch.zeros_like(recon_normalized))
     targets_np = tumor_mask.cpu().numpy().astype(np.uint8)
 
     debug_folder = Path("inference_masks_v2")
     debug_folder.mkdir(exist_ok=True)
 
-    # --- PHYSICAL SPACING SETUP ---
-    # Assuming original model outputs 3mm spacing
     base_spacing = spacing
     scale_factor = spacing[0]
 
-    # Calculate the new voxel spacing after upsampling
     post_spacing = (
         base_spacing[0] / scale_factor,
         base_spacing[1] / scale_factor,
@@ -268,7 +212,14 @@ def generate_samples(train_data, step, diffusion, cond_scale=2.0, spacing=(3.0, 
     new_affine = base_affine.copy()
     new_affine[:3, :3] /= scale_factor
 
-    output_metrics = []
+    numerical_features = [
+        "major_axis_mm", "minor_axis_mm", "least_axis_mm",
+        "volume_ml", "sphericity", "surface_volume_ratio",
+        "elongation", "flatness", "max_3d_diameter_mm",
+        "num_components"
+    ]
+
+    output_tasks = []
 
     with open(norm_stats, "r") as f:
         normalized_stats = json.load(f)
@@ -278,57 +229,44 @@ def generate_samples(train_data, step, diffusion, cond_scale=2.0, spacing=(3.0, 
             targ_3d = targets_np[b_idx, 0, :, :, :]
 
             # --- POST-PROCESSING ---
-            # Pass the raw un-thresholded probabilities into the post-processor
             cleaned_pred_3d = postprocess_tensor(
                 raw_3d,
                 scale_factor=scale_factor,
-                threshold=0.5,
-                num_components=1
+                threshold=0.5
             )
-
-            # Pass the POST_SPACING, not the spatial_shape grid dims
-            metrics = compute_diameters_and_coords(
-                cleaned_pred_3d, post_spacing)
-            print(f"\n===== SAMPLE {b_idx+1} =====")
-
-            for key in metrics.keys():
-                # Denormalize the requested target condition
+            
+            # --- PREPARE DATA FOR PARALLEL METRICS EXTRACTION ---
+            target_vals = {}
+            for key in numerical_features:
                 normalized_conditioner = train_data[key][b_idx].item()
-                target_real_val = (
-                    normalized_conditioner * normalized_stats[key]["std"]) + normalized_stats[key]["mean"]
-                print(f"  {key}:")
-                print(f"    Requested: {target_real_val:.2f}")
-                print(f"    Generated: {metrics[key]:.2f}")
-                print(
-                    f"    Delta:     {abs(target_real_val - metrics[key]):.2f}")
+                target_real_val = (normalized_conditioner * normalized_stats[key]["std"]) + normalized_stats[key]["mean"]
+                target_vals[key] = target_real_val
 
-                output_metrics.append({"cond_scale": cond_scale, "column_task": train_data["column_task"][
-                                      b_idx], "column": key, "desired_val": target_real_val, "actual_val": metrics[key]})
+            output_tasks.append({
+                "cleaned_pred_3d": cleaned_pred_3d,
+                "post_spacing": post_spacing,
+                "cond_scale": cond_scale,
+                "column_task": train_data["column_task"][b_idx] if "column_task" in train_data else "Unknown",
+                "target_vals": target_vals
+            })
 
-            print("======================\n")
-
-            # --- SAVE NIFTIS WITH CORRECT AFFINES ---
-            # Save the raw 32x32x32 output with base affine
-            nib.save(
-                nib.Nifti1Image(raw_3d, affine=base_affine),
-                str(debug_folder /
-                    f"step_stomach_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_RAW.nii.gz")
-            )
-
-            # Save the upscaled and cleaned output with new affine
+            # Save the raw output
+            if(save_raw):
+                nib.save(
+                    nib.Nifti1Image(raw_3d, affine=base_affine),
+                    str(debug_folder / f"step_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_RAW.nii.gz")
+                )
+            # Save the cleaned output
             nib.save(
                 nib.Nifti1Image(cleaned_pred_3d, affine=new_affine),
-                str(debug_folder /
-                    f"step_stomach_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_CLEANED.nii.gz")
+                str(debug_folder / f"step_inference_{step}_sample_{b_idx}_cfg_{cond_scale}_CLEANED.nii.gz")
             )
 
-    return output_metrics
+    return output_tasks
 
 
-def reconstruct(cfg, test_dataset_name="multi_tumor_train", test_dataset_file="EvaluationSpacedData.csv", model_name="model_best.pt", dims=(48, 48, 48), spacing=(3.0, 3.0, 3.0), output_file="metrics.csv", cond_scales=[1.0, 2.0, 4.0, 6.0], results_folder_name="mask_diffusion_train_pro_v6", norm_stats="dataset_norm_stats.json"):
-    cfg.dataset.datafile = test_dataset_file
+def reconstruct(cfg, model_name="model_best.pt", output_file="metrics.csv", cond_scales=[1.0, 2.0, 4.0, 6.0], use_ddpm=False, ddim_steps=50, results_folder_name="mask_diffusion_train_pro_v7", norm_stats="dataset_norm_stats.json", save_raw=False):
     cfg.model.results_folder_postfix = results_folder_name
-    cfg.dataset.name = test_dataset_name
 
     torch.cuda.set_device(cfg.model.gpus)
     device = torch.device(f"cuda:{cfg.model.gpus}")
@@ -341,10 +279,9 @@ def reconstruct(cfg, test_dataset_name="multi_tumor_train", test_dataset_file="E
     model = Unet3D(
         dim=cfg.model.diffusion_img_size,
         dim_mults=cfg.model.dim_mults,
-        # target (1) + img_cond (VQ_dim) + organ (1) + feat (1)
         channels=cfg.model.diffusion_num_channels,
         out_dim=1,
-        num_continuous_conditioners=10,
+        num_continuous_conditioners=10, # Exactly 10 matching your metrics evaluator
         num_organs=9
     ).cuda()
 
@@ -363,29 +300,59 @@ def reconstruct(cfg, test_dataset_name="multi_tumor_train", test_dataset_file="E
     diffusion.load_state_dict(data['ema'])
     diffusion.eval()
 
-    print("3. Loading Data & Diagnosing Labels...")
+    print("3. Generating Samples...")
     val_loader, _, _ = get_loader(cfg.dataset)
     loader_iter = iter(val_loader)
     step = 0
-    all_metrics = []
+    all_radiomics_tasks = []
 
-    for train_data in tqdm(loader_iter):
-        print(f"STEP: {step+1}")
+    for train_data in tqdm(loader_iter, desc="Generating Batches"):
         for scale in cond_scales:
-            output_metrics = generate_samples(
-                train_data, step+1, diffusion, cond_scale=scale, spacing=spacing, dims=dims, norm_stats=norm_stats)
-            all_metrics.extend(output_metrics)
-        print(all_metrics)
-        print("================")
-
+            # Generate masks and collect task data for later calculation
+            batch_tasks = generate_samples(
+                train_data, 
+                step+1, 
+                diffusion, 
+                cond_scale=scale, 
+                ddim_steps=ddim_steps, 
+                use_ddpm=use_ddpm, 
+                spacing=(cfg.dataset.space_x, cfg.dataset.space_y, cfg.dataset.space_z), 
+                dims=(cfg.dataset.roi_x,cfg.dataset.roi_y, cfg.dataset.roi_z), 
+                norm_stats=norm_stats, 
+                save_raw=save_raw
+            )
+            all_radiomics_tasks.extend(batch_tasks)
+        
         step += 1
+
+    print("4. Calculating Radiomics Metrics in Parallel...")
+    all_metrics = []
+    num_workers = cfg.dataset.num_workers if hasattr(cfg.dataset, "num_workers") and cfg.dataset.num_workers > 0 else 1
+    
+    with multiprocessing.Pool(processes=num_workers) as pool:
+        for result_batch in tqdm(pool.imap_unordered(process_radiomics_worker, all_radiomics_tasks), total=len(all_radiomics_tasks), desc="Extracting Radiomics"):
+            all_metrics.extend(result_batch)
 
     metrics_df = pd.DataFrame(all_metrics)
     metrics_df.to_csv(output_file, index=False)
+    print(f"Inference complete! Metrics saved to {output_file}")
 
 
 if __name__ == '__main__':
     initialize(version_base=None, config_path="config")
-    cfg = compose(config_name="base_cfg")
-    reconstruct(cfg, test_dataset_file="EvaluationSpacedData.csv", spacing=(3.0, 3.0, 3.0),
-                output_file="metrics.csv", dims=(48, 48, 48), cond_scales=[1.0, 2.0, 4.0, 6.0])
+    
+    # --- HYDRA OVERRIDE ---
+    # Compose the config by keeping the base models but swapping out the dataset config
+    # Ensure "inference_dataset" exists in your config/ folder (e.g. inference_dataset.yaml)
+    cfg = compose(config_name="base_cfg", overrides=["dataset=inference_dataset"])
+    
+    reconstruct(
+        cfg, 
+        output_file="metrics_v8.csv",
+        cond_scales=[1.0, 4.0, 8.0],
+        use_ddpm=True,     # <--- SET TO TRUE TO RUN STANDARD DDPM
+        ddim_steps=200,    # Will be ignored if use_ddpm=True
+        norm_stats="dataset_norm_stats.json",
+        results_folder_name="mask_diffusion_train_pro_v8",
+        save_raw=True
+    )
