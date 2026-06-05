@@ -274,8 +274,16 @@ class SafeDataset(TorchDataset):
         raise RuntimeError("Failed to load 10 consecutive images. Check your data path.")
 
     def __getattr__(self, attr):
+        # 1. Ignore internal python dunder methods during unpickling
+        if attr.startswith('__') and attr.endswith('__'):
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{attr}'")
+            
+        # 2. Prevent recursion if 'dataset' hasn't been initialized yet
+        if 'dataset' not in self.__dict__:
+            raise AttributeError(f"'{type(self).__name__}' has no attribute '{attr}' (dataset not initialized)")
+            
         return getattr(self.dataset, attr)
-        Z
+        
             
 def get_loader(args):
     train_transforms = Compose(
@@ -349,20 +357,20 @@ def get_loader(args):
         ]
     )
 
-    if args.phase == 'train':        
-        train_img=[]
-        train_lbl=[]
-        train_name=[]
-        for line in open(os.path.join(args.data_txt_path,  args.dataset_list+'.txt')):
-            name = line.strip()
-            train_img.append(os.path.join(args.data_root_path, args.img_path, name + '/ct.nii.gz'))
-            train_lbl.append(os.path.join(args.data_root_path, args.seg_path, name + '/segmentations/'))
-            train_name.append(name)
+        if args.phase == 'train':        
+            train_img=[]
+            train_lbl=[]
+            train_name=[]
+            for line in open(os.path.join(args.data_txt_path,  args.dataset_list+'.txt')):
+                name = line.strip()
+                train_img.append(os.path.join(args.data_root_path, args.img_path, name + '/ct.nii.gz'))
+                train_lbl.append(os.path.join(args.data_root_path, args.seg_path, name + '/segmentations/'))
+                train_name.append(name)
 
-        
-        data_dicts_train = [{'image': image, 'label': label, 'name': name}
-                    for image, label, name in zip(train_img, train_lbl, train_name)]
-        print('train len {}'.format(len(data_dicts_train)))
+            
+            data_dicts_train = [{'image': image, 'label': label, 'name': name}
+                        for image, label, name in zip(train_img, train_lbl, train_name)]
+            print('train len {}'.format(len(data_dicts_train)))
         # data_dicts_train=data_dicts_train[:10]
         # breakpoint()
     

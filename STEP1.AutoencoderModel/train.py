@@ -4,6 +4,7 @@ import glob
 sys.path.append(os.getcwd())
 import lightning.pytorch as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
+from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader
 from vq_gan_3d.model import VQGAN
 from callbacks import ImageLogger, VideoLogger
@@ -12,6 +13,9 @@ from omegaconf import DictConfig, open_dict
 from dataset.dataloader import get_loader
 import argparse
 import logging
+import os
+os.environ["MASTER_PORT"] = "32427"
+
 logging.disable(logging.WARNING)
 
 def get_parameter_number(model):
@@ -84,10 +88,19 @@ def run(cfg: DictConfig, args=None):
         model = VQGAN.load_from_checkpoint(cfg.model.pretrained_checkpoint, cfg=cfg)
         print('load pretrained model:', cfg.model.pretrained_checkpoint)
 
+
+    if cfg.model.gpus > 1:
+        custom_strategy = DDPStrategy(
+            start_method='spawn', 
+            find_unused_parameters=True # <- This tells DDP to ignore frozen subnetworks
+        )
+    else:
+        custom_strategy = "auto"
+
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=cfg.model.gpus,
-        strategy="ddp" if cfg.model.gpus > 1 else "auto",
+        strategy=custom_strategy,
         accumulate_grad_batches=cfg.model.accumulate_grad_batches,
         default_root_dir=cfg.model.default_root_dir,
         callbacks=callbacks,
@@ -101,4 +114,7 @@ def run(cfg: DictConfig, args=None):
 
 
 if __name__ == '__main__':
+    for key in list(os.environ.keys()): # necessary to avoid conflicts between process spawning
+        if key.startswith("SLURM_"):
+            del os.environ[key]
     run()

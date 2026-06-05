@@ -40,9 +40,13 @@ def vanilla_d_loss(logits_real, logits_fake):
     return d_loss
 
 
+
+
+
 class VQGAN(pl.LightningModule):
     def __init__(self, cfg):
         super().__init__()
+
         self.cfg = cfg
         self.embedding_dim = cfg.model.embedding_dim
         self.automatic_optimization = False
@@ -75,6 +79,8 @@ class VQGAN(pl.LightningModule):
             self.disc_loss = hinge_d_loss
 
         self.perceptual_model = LPIPS().eval()
+        for param in self.perceptual_model.parameters():
+            param.requires_grad = False
 
         self.image_gan_weight = cfg.model.image_gan_weight
         self.video_gan_weight = cfg.model.video_gan_weight
@@ -83,6 +89,13 @@ class VQGAN(pl.LightningModule):
 
         self.l1_weight = cfg.model.l1_weight
         self.save_hyperparameters()
+
+
+    def on_fit_start(self):
+        if(self.cfg.model.gpus > 0):
+            print("world_size:", self.trainer.world_size)
+            print("global_rank:", self.trainer.global_rank)
+            print("local_rank:", self.trainer.local_rank)
 
     def encode(self, x, include_embeddings=False, quantize=True):
         h = self.pre_vq_conv(self.encoder(x))
@@ -110,17 +123,17 @@ class VQGAN(pl.LightningModule):
         recon_loss = F.l1_loss(x_recon, x) * self.l1_weight
 
         # Selects one random 2D image from each 3D Image
-        frame_idx_T = torch.randint(0, D, [B]).cuda()
+        frame_idx_T = torch.randint(0, D, [B], device=x.device)
         frame_idx_selected_T = frame_idx_T.reshape(-1, 1, 1, 1, 1).repeat(1, C, 1, H, W)
         frames_T = torch.gather(x, 2, frame_idx_selected_T).squeeze(2)
         frames_recon_T = torch.gather(x_recon, 2, frame_idx_selected_T).squeeze(2)
 
-        frame_idx_H = torch.randint(0, H, [B]).cuda()
+        frame_idx_H = torch.randint(0, H, [B], device=x.device)
         frame_idx_selected_H = frame_idx_H.reshape(-1, 1, 1, 1, 1).repeat(1, C, D, 1, W)
         frames_H = torch.gather(x, 3, frame_idx_selected_H).squeeze(3)
         frames_recon_H = torch.gather(x_recon, 3, frame_idx_selected_H).squeeze(3)
 
-        frame_idx_W = torch.randint(0, W, [B]).cuda()
+        frame_idx_W = torch.randint(0, W, [B], device=x.device)
         frame_idx_selected_W = frame_idx_W.reshape(-1, 1, 1, 1, 1).repeat(1, C, D, H, 1)
         frames_W = torch.gather(x, 4, frame_idx_selected_W).squeeze(4)
         frames_recon_W = torch.gather(x_recon, 4, frame_idx_selected_W).squeeze(4)
@@ -234,6 +247,16 @@ class VQGAN(pl.LightningModule):
                                    self.perceptual_model(frames_W, frames_recon_W).mean()) * self.perceptual_weight
         return recon_loss, x_recon, vq_output, perceptual_loss
 
+
+    def set_requires_grad(self, nets, requires_grad=False):
+        """Helper to toggle gradient calculation for a list of networks."""
+        if not isinstance(nets, list):
+            nets = [nets]
+        for net in nets:
+            if net is not None:
+                for param in net.parameters():
+                    param.requires_grad = requires_grad
+
     def training_step(self, batch, batch_idx):
         import time
 
@@ -246,6 +269,13 @@ class VQGAN(pl.LightningModule):
         x = x.as_tensor() if hasattr(x, 'as_tensor') else x
         x = x.contiguous().permute(0, 1, -1, -3, -2).detach()
 
+
+        generator_nets = [self.encoder, self.decoder, self.pre_vq_conv, self.post_vq_conv, self.codebook]
+        discriminator_nets = [self.image_discriminator, self.video_discriminator]
+
+        self.set_requires_grad(generator_nets, True)
+        self.set_requires_grad(discriminator_nets, False)
+
         # Generator step
         t_forward_start = time.perf_counter()
         opt_ae.zero_grad()
@@ -255,6 +285,11 @@ class VQGAN(pl.LightningModule):
         self.manual_backward(loss_ae)
         self.clip_gradients(opt_ae, gradient_clip_val=self.cfg.model.gradient_clip_val, gradient_clip_algorithm="norm")
         opt_ae.step()
+
+
+
+        self.set_requires_grad(generator_nets, False)
+        self.set_requires_grad(discriminator_nets, True)
 
         # Discriminator step
         opt_disc.zero_grad()
