@@ -375,7 +375,6 @@ class Unet3D(nn.Module):
     def __init__(
         self,
         dim,
-        cond_dim=None,
         out_dim=None,
         dim_mults=(1, 2, 4, 8),
         channels=3,
@@ -387,7 +386,7 @@ class Unet3D(nn.Module):
         block_type='resnet',
         resnet_groups=8,
         num_organs=9,
-        num_continuous_conditioners=4
+        num_continuous_conditioners=10
     ):
         super().__init__()
         self.channels = channels
@@ -430,23 +429,27 @@ class Unet3D(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
-        # text conditioning
+        # tabular conditioning
 
         self.num_organs = num_organs
         # diameters, volumes, means, stds
         self.num_continuous_conditioners = num_continuous_conditioners
 
+        self.tabular_cond_dim = self.num_organs + self.num_continuous_conditioners
+
         # Total input to the MLP is now: 9 (one-hot organ) + 4 (continuous) = 13
         self.cond_mlp = nn.Sequential(
-            nn.Linear(self.num_organs +
-                      self.num_continuous_conditioners, time_dim),
+            nn.Linear(self.tabular_cond_dim, time_dim),
             nn.SiLU(),
             nn.LayerNorm(time_dim),
             nn.Linear(time_dim, time_dim)
         )
 
-        nn.init.zeros_(self.cond_mlp[-1].weight)
-        nn.init.zeros_(self.cond_mlp[-1].bias)
+        self.tabular_null_cond_emb = nn.Parameter(
+            torch.randn(1, self.tabular_cond_dim))
+
+        #nn.init.zeros_(self.cond_mlp[-1].weight)
+        #nn.init.zeros_(self.cond_mlp[-1].bias)
 
         # layers
 
@@ -511,7 +514,9 @@ class Unet3D(nn.Module):
         logits = self.forward(*args, null_cond_prob=0., **kwargs)
 
         # If scale is 1 or no condition is passed, return standard logits
-        if cond_scale == 1 or 'cond' not in kwargs or kwargs['cond'] is None:
+        if cond_scale == 1 or (
+            kwargs.get('cond') is None and kwargs.get('tabular_cond') is None
+        ):
             return logits
 
         # Unconditional pass: drop 100% of the conditions
@@ -526,7 +531,7 @@ class Unet3D(nn.Module):
         time,
         cond=None,
         tabular_cond=None,
-        null_cond_prob=0.,
+        null_cond_prob=0.10,
         focus_present_mask=None,
         prob_focus_present=0.
     ):
@@ -552,18 +557,20 @@ class Unet3D(nn.Module):
         # 3. Handle Timestep & Tabular Embedding
         t = self.time_mlp(time)
 
-        if tabular_cond is not None:
-            # Generate the embedding from the 11-dimensional vector
-            tab_emb = self.cond_mlp(tabular_cond)  # Shape: (B, time_emb_dim)
-
-            # Reshape mask to (B, 1) for the 1D embedding
+        if exists(tabular_cond):
             emb_mask = drop_mask.view(batch, 1)
 
-            # Zero out the tabular embeddings for the dropped batch items
-            tab_emb = torch.where(emb_mask, torch.zeros_like(tab_emb), tab_emb)
+            # Replace input with null embedding BEFORE passing through MLP
+            tabular_cond = torch.where(
+                emb_mask.bool(),
+                self.tabular_null_cond_emb.expand(batch, -1),
+                tabular_cond
+            )
 
-            # Add to the timestep embedding
+            # Now project to time_dim space
+            tab_emb = self.cond_mlp(tabular_cond)
             t = t + tab_emb
+
 
         h = []
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
