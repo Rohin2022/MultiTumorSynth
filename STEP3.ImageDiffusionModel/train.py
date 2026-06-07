@@ -20,8 +20,10 @@ def run(cfg: DictConfig):
         model = Unet3D(
             dim=cfg.model.diffusion_img_size,
             dim_mults=cfg.model.dim_mults,
-            channels=cfg.model.diffusion_num_channels,
-            out_dim=cfg.model.out_dim
+            channels=2, # image (1) and tumor mask (1)
+            out_dim=cfg.model.out_dim,
+            num_continuous_conditioners=9,
+            num_organs=9
         ).cuda()
     else:
         raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")

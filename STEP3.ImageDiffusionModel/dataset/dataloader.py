@@ -25,6 +25,7 @@ import math
 import pickle
 import shutil
 import sys
+import pandas as pd
 import tempfile
 import threading
 import time
@@ -105,68 +106,9 @@ class LoadImageh5d(MapTransform):
         #     data = hf['post_label'][()]
         # d['post_label'] = data[0]
         return d
-
-class RandZoomd_select(RandZoomd):
-    def __call__(self, data):
-        d = dict(data)
-        name = d['name']
-        key = get_key(name)
-        if (key not in ['10_03', '10_06', '10_07', '10_08', '10_09', '10_10']):
-            return d
-        d = super().__call__(d)
-        return d
-
-
-class RandCropByPosNegLabeld_select(RandCropByPosNegLabeld):
-    def __call__(self, data):
-        d = dict(data)
-        name = d['name']
-        key = get_key(name)
-        if key in ['10_03', '10_07', '10_08', '04', '05']: # if key in ['10_03', '10_07', '10_08', '04']
-            return d
-        d = super().__call__(d)
-        return d
-
-class RandCropByLabelClassesd_select(RandCropByLabelClassesd):
-    def __call__(self, data):
-        d = dict(data)
-        name = d['name']
-        key = get_key(name)
-        # print('key',key)
-        if key not in ['10_03', '10_07', '10_08', '04', '05']: # if key in ['10_03', '10_07', '10_08', '04']
-            return d
-        d = super().__call__(d)
-        return d
-
-class Compose_Select(Compose):
-    def __call__(self, input_):
-        name = input_['name']
-        key = get_key(name)
-        for index, _transform in enumerate(self.transforms):
-            # for RandCropByPosNegLabeld and RandCropByLabelClassesd case
-            if (key in ['10_03', '10_07', '10_08', '04']) and (index == 8):
-                continue
-            elif (key not in ['10_03', '10_07', '10_08', '04']) and (index == 9):
-                continue
-            # for RandZoomd case
-            if (key not in ['10_03', '10_06', '10_07', '10_08', '10_09', '10_10']) and (index == 7):
-                continue
-            input_ = apply_transform(_transform, input_, self.map_items, self.unpack_items, self.log_stats)
-        return input_
-    
     
 from monai.transforms import MapTransform
 
-class KeepOnlyTensorsd(MapTransform):
-    """
-    Strips out MONAI's hidden numpy meta_dicts that crash the DataLoader 
-    when batch_size > 1.
-    """
-    def __call__(self, data):
-        return {
-            "image": data["image"],
-            "label": data["label"]
-        }
 
 def get_loader(args):
     train_transforms = Compose(
@@ -221,7 +163,7 @@ def get_loader(args):
             #     prob=0.20,
             # ),
             ToTensord(keys=["image", "label"]),
-            KeepOnlyTensorsd(keys=["image", "label"])
+            #KeepOnlyTensorsd(keys=["image", "label"])
         ]
     )
 
@@ -267,7 +209,7 @@ def get_loader(args):
                 image_threshold=0,
             ),
             ToTensord(keys=["image", "label"]),
-            KeepOnlyTensorsd(keys=["image", "label"])
+            #KeepOnlyTensorsd(keys=["image", "label"])
             
         ]
     )
@@ -277,25 +219,101 @@ def get_loader(args):
     
     # breakpoint()
     if args.phase == 'train':
-        ## training dict part
-        train_img = []
-        train_lbl = []
-        train_name = []
+        tumor_metrics = pd.read_csv(os.path.join(
+            args.tumor_csv_path, args.dataset_list, f'{args.tumor_datafile}'))
+
+        tumor_mask_metrics = pd.read_csv(os.path.join(
+            args.tumor_csv_path, args.dataset_list, f'{args.tumor_masks_datafile}'
+        ))
+
+        train_input = pd.merge(tumor_metrics, tumor_mask_metrics, how="inner", on="bdmap_id")
+
+        train_input["tumor_mask"] = train_input.apply(
+            lambda row: os.path.join(args.segmentations_root_path, str(
+                row["bdmap_id"]), "segmentations", f"{row['organ']}_lesion.nii.gz"),
+            axis=1
+        )
+
         
 
-        for item in args.dataset_list:
-            for line in open(os.path.join(args.data_txt_path,  item, 'real_tumor_train_{}.txt'.format(args.fold))):
-                name = line.strip().split()[1].split('.')[0]
-                train_img.append(args.data_root_path + line.strip().split()[0])
-                train_lbl.append(args.label_root_path + line.strip().split()[1])
-                train_name.append(name)
-        data_dicts_train = [{'image': image, 'label': label, 'name': name}
-                for image, label, name in zip(train_img, train_lbl, train_name)]
-        # data_dicts_train=data_dicts_train[:3]
+        organ_mapping = {
+            'spleen': 0,
+            'bladder': 1,
+            'gallbladder': 2,
+            'esophagus': 3,
+            'stomach': 4,
+            'duodenum': 5,
+            'colon': 6,
+            'prostate': 7,
+            'uterus': 8
+        }
+
+        # 1. Drop invalid rows first
+        train_input = train_input[train_input["organ"].isin(
+            list(organ_mapping.keys()))]
+        train_input = train_input[train_input["volume_ml"] > 0.0]
+
+        # 2. CALCULATE WEIGHTS FIRST (While volume_ml is still in true mL)
+        vol_cutoff = float(train_input['volume_ml'].quantile(0.98))
+        train_input['capped_volume'] = np.clip(
+            train_input['volume_ml'], a_min=0, a_max=vol_cutoff)
+        train_input['volume_bin'] = pd.cut(
+            train_input['capped_volume'], bins=5, labels=False)
+
+        organ_counts = train_input['organ'].value_counts()
+        volume_counts = train_input['volume_bin'].value_counts()
+
+        def compute_dual_weight(row):
+            f_organ = organ_counts[row['organ']]
+            f_vol = volume_counts[row['volume_bin']]
+            return (1.0 / np.sqrt(f_organ)) * (1.0 / np.sqrt(f_vol))
+
+        train_input['sample_weight'] = train_input.apply(
+            compute_dual_weight, axis=1)
+
+        # 3. NOW MAP ORGAN STRINGS TO INTEGERS
+        train_input["organ"] = train_input.apply(
+            lambda row: organ_mapping[row["organ"]], axis=1)
+
+        # 4. NOW NORMALIZE NUMERIC FEATURES FOR THE MODEL
+        import json
+        from pandas.api.types import is_numeric_dtype
+
+        stats_file = "dataset_norm_stats.json"
+        exclude_cols = ['volume_bin', 'sample_weight', 'organ',
+                        'tumor_mask', 'organ_mask', 'capped_volume', 'column_task']
+
+        if os.path.exists(stats_file):
+            print("Loading existing normalization statistics...")
+            with open(stats_file, "r") as f:
+                normalization_stats = json.load(f)
+        else:
+            print("Generating new normalization statistics...")
+            normalization_stats = {}
+            for key in train_input.columns:
+                if key in exclude_cols or not is_numeric_dtype(train_input[key]):
+                    continue
+
+                normalization_stats[key] = {
+                    "mean": float(train_input[key].mean()),
+                    "std": float(train_input[key].std() + 1e-6)
+                }
+
+            with open(stats_file, "w") as f:
+                json.dump(normalization_stats, f, indent=4)
+            print("Saved new normalization data.")
+
+        # Apply the normalization (using loaded or newly generated stats)
+        for key, stats in normalization_stats.items():
+            if key in train_input.columns:
+                train_input[key] = (train_input[key] -
+                                    stats["mean"]) / stats["std"]
+
+        # 5. CONVERT TO DICTIONARY RECORDS FOR MONAI
+        data_dicts_train = train_input.to_dict("records")
         print('train len {}'.format(len(data_dicts_train)))
 
-        persistent_cache_dir = os.path.join(args.data_root_path, "monai_persistent_cache")
-        os.makedirs(persistent_cache_dir, exist_ok=True)
+
 
         if args.cache_dataset:
             if args.uniform_sample:

@@ -380,7 +380,9 @@ class Unet3D(nn.Module):
         init_kernel_size=7,
         use_sparse_linear_attn=True,
         block_type='resnet',
-        resnet_groups=8
+        resnet_groups=8,
+        num_organs = 9,
+        num_continuous_conditioners=9
     ):
         super().__init__()
         self.channels = channels
@@ -423,15 +425,35 @@ class Unet3D(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
-        # text conditioning
+        self.num_organs = num_organs
+        # diameters, volumes, means, stds
+        self.num_continuous_conditioners = num_continuous_conditioners
 
+        self.tabular_cond_dim = self.num_organs + self.num_continuous_conditioners
+
+        # Total input to the MLP is now: 9 (one-hot organ) + 9 (continuous) = 18
+        self.tabular_cond_mlp = nn.Sequential(
+            nn.Linear(self.tabular_cond_dim, time_dim),
+            nn.SiLU(),
+            nn.LayerNorm(time_dim),
+            nn.Linear(time_dim, time_dim)
+        )
+
+        #nn.init.zeros_(self.cond_mlp[-1].weight)
+        #nn.init.zeros_(self.cond_mlp[-1].bias)
+
+
+        # text conditioning
+        '''
         self.has_cond = exists(cond_dim) or use_bert_text_cond
         cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
 
-        self.null_cond_emb = nn.Parameter(
-            torch.randn(1, cond_dim)) if self.has_cond else None
+        
 
-        cond_dim = time_dim + int(cond_dim or 0)
+        cond_dim = time_dim + int(cond_dim or 0)'''
+
+        self.tabular_null_cond_emb = nn.Parameter(
+            torch.randn(1, self.tabular_cond_dim))
 
         # layers
 
@@ -442,7 +464,7 @@ class Unet3D(nn.Module):
         # block type
 
         block_klass = partial(ResnetBlock, groups=resnet_groups)
-        block_klass_cond = partial(block_klass, time_emb_dim=cond_dim)
+        block_klass_cond = partial(block_klass, time_emb_dim=time_dim)
 
         # modules for all layers
         for ind, (dim_in, dim_out) in enumerate(in_out):
@@ -494,7 +516,9 @@ class Unet3D(nn.Module):
         **kwargs
     ):
         logits = self.forward(*args, null_cond_prob=0., **kwargs)
-        if cond_scale == 1 or not self.has_cond:
+        if cond_scale == 1 or (
+            kwargs.get('cond') is None and kwargs.get('tabular_cond') is None
+        ):
             return logits
 
         null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
@@ -505,16 +529,22 @@ class Unet3D(nn.Module):
         x,
         time,
         cond=None,
-        null_cond_prob=0.,
+        tabular_cond=None,
+        textual_cond_embed=None,
+        null_cond_prob=0.10,
         focus_present_mask=None,
         # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
         prob_focus_present=0.
     ):
-        assert not (self.has_cond and not exists(cond)
-                    ), 'cond must be passed in if cond_dim specified'
-        x = torch.cat([x, cond], dim=1)
 
         batch, device = x.shape[0], x.device
+
+        drop_mask = torch.rand(batch, device=device) < null_cond_prob
+
+        if exists(cond):
+            spatial_mask = drop_mask.view(batch, 1, 1, 1, 1)
+            cond = torch.where(spatial_mask, torch.zeros_like(cond), cond)
+            x = torch.cat([x, cond], dim=1)
 
         focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
             (batch,), prob_focus_present, device=device))
@@ -526,16 +556,23 @@ class Unet3D(nn.Module):
 
         x = self.init_temporal_attn(x, pos_bias=time_rel_pos_bias)
 
-        t = self.time_mlp(time) if exists(self.time_mlp) else None # [2, 128]
+        t = self.time_mlp(time)
 
         # classifier free guidance
 
-        if self.has_cond:
-            batch, device = x.shape[0], x.device
-            mask = prob_mask_like((batch,), null_cond_prob, device=device)
-            cond = torch.where(rearrange(mask, 'b -> b 1'),
-                               self.null_cond_emb, cond)
-            t = torch.cat((t, cond), dim=-1)
+        if exists(tabular_cond):
+            emb_mask = drop_mask.view(batch, 1)
+
+            # Replace input with null embedding BEFORE passing through MLP
+            tabular_cond = torch.where(
+                emb_mask.bool(),
+                self.tabular_null_cond_emb.expand(batch, -1),
+                tabular_cond
+            )
+
+            # Now project to time_dim space
+            tab_emb = self.tabular_cond_mlp(tabular_cond)
+            t = t + tab_emb
 
         h = []
         
@@ -696,9 +733,9 @@ class GaussianDiffusion(nn.Module):
             self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, cond_scale=1.):
+    def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, tabular_cond=None, textual_cond=None, cond_scale=1.):
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, cond_scale=cond_scale))
+            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, textual_cond=textual_cond, cond_scale=cond_scale))
 
         if clip_denoised:
             s = 1.
@@ -720,10 +757,10 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance
 
     @torch.inference_mode()
-    def p_sample(self, x, t, cond=None, cond_scale=1., clip_denoised=True):
+    def p_sample(self, x, t, cond=None, tabular_cond=None, textual_cond=None, cond_scale=1., clip_denoised=True):
         b, *_, device = *x.shape, x.device
         model_mean, _, model_log_variance = self.p_mean_variance(
-            x=x, t=t, clip_denoised=clip_denoised, cond=cond, cond_scale=cond_scale)
+            x=x, t=t, clip_denoised=clip_denoised, cond=cond, tabular_cond=tabular_cond, textual_cond=textual_cond, cond_scale=cond_scale)
         noise = torch.randn_like(x)
         # no noise when t == 0
         nonzero_mask = (1 - (t == 0).float()).reshape(b,
@@ -731,7 +768,7 @@ class GaussianDiffusion(nn.Module):
         return model_mean + nonzero_mask * (0.5 * model_log_variance).exp() * noise
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, cond=None, cond_scale=1.):
+    def p_sample_loop(self, shape, cond=None, tabular_cond=None, textual_cond=None, cond_scale=1.):
         device = self.betas.device
 
         b = shape[0]
@@ -739,12 +776,13 @@ class GaussianDiffusion(nn.Module):
         print('cond', cond.shape)
         for i in tqdm(reversed(range(0, self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
             img = self.p_sample(img, torch.full(
-                (b,), i, device=device, dtype=torch.long), cond=cond, cond_scale=cond_scale)
+                (b,), i, device=device, dtype=torch.long), cond=cond, tabular_cond=tabular_cond, textual_cond=textual_cond, cond_scale=cond_scale)
 
         return img
 
     @torch.inference_mode()
     def sample(self, cond=None, cond_scale=1., batch_size=16):
+        raise NotImplementedError("IMPLEMENT ROHIN")
         device = next(self.denoise_fn.parameters()).device
 
         if is_list_str(cond):
@@ -794,17 +832,18 @@ class GaussianDiffusion(nn.Module):
                     t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, noise=None, **kwargs):
+    def p_losses(self, x_start, t, cond=None, tabular_cond=None, textual_cond=None, noise=None, null_cond_prob=0.10, **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
 
-        if is_list_str(cond):
-            cond = bert_embed(
-                tokenize(cond), return_cls_repr=self.text_use_bert_cls)
-            cond = cond.to(device)
+        textual_cond_embed = None
+        if exists(textual_cond):
+            textual_cond_embed = bert_embed(
+                tokenize(textual_cond), return_cls_repr=self.text_use_bert_cls)
+            textual_cond_embed = textual_cond_embed.to(device)
 
-        x_recon = self.denoise_fn(x_noisy, t, cond=cond, **kwargs)
+        x_recon = self.denoise_fn(x_noisy, t, cond=cond, tabular_cond=tabular_cond, textual_cond_embed = textual_cond_embed, null_cond_prob=null_cond_prob, **kwargs)
 
         if self.loss_type == 'l1':
             loss = F.l1_loss(noise, x_recon)
@@ -815,10 +854,7 @@ class GaussianDiffusion(nn.Module):
 
         return loss
 
-    def forward(self, x, *args, **kwargs):
-        bs = int(x.shape[0]/2)
-        img=x[:bs,...]
-        mask=x[bs:,...]
+    def forward(self, img, mask, tabular_cond, textual_cond=None, null_cond_prob=0.10, *args, **kwargs):
         mask_=(1-mask).detach()
         masked_img = (img*mask_).detach()
         masked_img=masked_img.permute(0,1,-1,-3,-2)
@@ -841,16 +877,16 @@ class GaussianDiffusion(nn.Module):
                      (self.vqgan.codebook.embeddings.max() -
                       self.vqgan.codebook.embeddings.min())) * 2.0 - 1.0
         else:
-            print("Hi")
             img = normalize_img(img)
             masked_img = normalize_img(masked_img)
+            
         mask = mask*2.0 - 1.0
         cc = torch.nn.functional.interpolate(mask, size=masked_img.shape[-3:])
         cond = torch.cat((masked_img, cc), dim=1)
 
         b, device, img_size, = img.shape[0], img.device, self.image_size
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        return self.p_losses(img, t, cond=cond, *args, **kwargs)
+        return self.p_losses(img, t, cond=cond, tabular_cond=tabular_cond, null_cond_prob=null_cond_prob, *args, **kwargs)
 
 # trainer class
 
@@ -911,6 +947,7 @@ class Trainer(object):
         self.len_dataloader = len(dl)
         self.dl = cycle(dl)
 
+        self.device = "cuda" if torch.cuda.is_available() else ""
         
         self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
         self.step = 0
@@ -964,6 +1001,41 @@ class Trainer(object):
         self.ema_model.load_state_dict(data['ema'], **kwargs)
         self.scaler.load_state_dict(data['scaler'])
 
+    def prepare_conditional_vector(self, data, device):
+        """
+        Extracts tabular features into a single tensor, one-hot encoding the organ.
+        Output shape: (Batch, 18) -> 9 organ classes + 9 numerical features
+        """
+        numerical_features = [
+            "attenuation_mean", "attenuation_stdev", "attenuation_delta", # attenuation_delta is (mean_tumor - mean_organ) / std_organ
+            "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
+            "glcm_contrast", "glcm_autocorrelation", "glcm_idm"
+        ]
+
+        # 1. Handle the categorical "organ" feature
+        organ_idx = torch.as_tensor(
+            data["organ"], dtype=torch.long, device=device).view(-1)
+
+        # One-hot encode to shape (Batch, 9) and cast back to float32
+        organ_one_hot = F.one_hot(organ_idx, num_classes=9).float()
+
+        # 2. Handle the remaining continuous numerical features
+        num_tensors = []
+        for key in numerical_features:
+            val = torch.as_tensor(
+                data[key], dtype=torch.float32, device=device).view(-1)
+            num_tensors.append(val)
+
+        # Stack continuous features to shape (Batch, 10)
+        continuous_vector = torch.stack(num_tensors, dim=1)
+
+        # 3. Concatenate the one-hot organ with the continuous features
+        # Resulting shape: (Batch, 19)
+        cond_vector = torch.cat([organ_one_hot, continuous_vector], dim=1)
+
+        return cond_vector
+
+
     def train(
         self,
         prob_focus_present=0.,
@@ -975,18 +1047,24 @@ class Trainer(object):
         while self.step < self.train_num_steps:
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl)
-                image = data['image'].cuda()
-                mask = data['label'].cuda()
-                mask[mask==1]=0
-                mask[mask==2]=1
+                
+                image = data['image'].to(self.device)
+                mask = data['label'].to(self.device)
+                #mask[mask==1]=0
+                #mask[mask==2]=1
 
-                input_data = torch.cat([image, mask], dim=0)
+                tabular_cond = self.prepare_conditional_vector(
+                    data, device=self.device)
 
                 with autocast(enabled=self.amp):
                     loss = self.model(
-                        input_data,
+                        image, 
+                        mask,
+                        tabular_cond,
+                        textual_cond=None,
                         prob_focus_present=prob_focus_present,
-                        focus_present_mask=focus_present_mask
+                        focus_present_mask=focus_present_mask,
+                        null_cond_prob=0.1
                     )
 
                     self.scaler.scale(
