@@ -64,14 +64,13 @@ class CacheConsumerDataset(IterableDataset):
                     images = images[shuffle_idx]
                     labels = labels[shuffle_idx]
                     contents = contents[shuffle_idx]
-                    
                     for i in range(num_crops):
                         yield {
                             "image": images[i].to(torch.float32),
                             "label": labels[i].to(torch.int64),
                             "contents": contents[i].to(torch.float32) 
                         }
-                    
+                    file_processed = True
                 except Exception as e:
                     print(f"[Consumer Error] Failed to read {locked_path}: {e}")
                     if os.path.exists(locked_path):
@@ -122,7 +121,7 @@ if __name__ == "__main__":
         num_workers = 2
 
     args = Args()
-    train_loader, _, _ = get_loader(args)
+    train_loader = get_loader(args)
     
     print("Testing stream...")
     for index, batch in enumerate(train_loader):
