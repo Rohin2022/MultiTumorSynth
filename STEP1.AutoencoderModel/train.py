@@ -13,6 +13,8 @@ from omegaconf import DictConfig, open_dict
 from dataset.dataloader_consumer import get_loader
 import argparse
 import logging
+import sys
+sys.path.insert(0, "/home/rpinise1/.cache/torch/hub/warvito_MedicalNet-models_main")
 import os
 os.environ["MASTER_PORT"] = "32427"
 

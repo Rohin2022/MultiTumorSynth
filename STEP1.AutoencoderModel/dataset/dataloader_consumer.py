@@ -51,7 +51,7 @@ class CacheConsumerDataset(IterableDataset):
 # 4. Lock Acquired! Load the data and destroy the file
                 try:
                     batch_data = torch.load(locked_path, map_location='cpu', weights_only=True)
-                    #os.remove(locked_path)
+                    os.remove(locked_path)
                     
                     images = batch_data["image"]
                     labels = batch_data["label"]
