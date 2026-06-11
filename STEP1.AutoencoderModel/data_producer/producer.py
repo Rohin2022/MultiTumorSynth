@@ -160,7 +160,7 @@ def init_worker(cfg: DictConfig):
         EnsureChannelFirstd(keys=["image", "label"]),
         Orientationd(keys=["image", "label"], axcodes="RAS"),
         Spacingd(keys=["image", "label"], pixdim=(cfg.dataset.space_x, cfg.dataset.space_y, cfg.dataset.space_z), mode=("bilinear", "nearest")),
-        ScaleIntensityRanged(keys=["image"], a_min=cfg.dataset.a_min, a_max=cfg.dataset.a_max, b_min=cfg.dataset.b_min, b_max=cfg.dataset.b_max, clip=True),
+        ScaleIntensityRanged(keys=["image"], a_min=cfg.dataset.a_min, a_max=cfg.dataset.a_max, b_min=cfg.dataset.b_min, b_max=cfg.dataset.b_max, clip=cfg.dataset.clip),
         SpatialPadd(keys=["image", "label"], spatial_size=(cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z), mode=["minimum", "constant"]),
         RandCropByPosNegLabeld(keys=["image", "label"], label_key="label", spatial_size=(cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z), pos=10, neg=1, num_samples=cfg.producer.num_samples, image_key="image", image_threshold=-1),
         RandRotate90d(keys=["image", "label"], prob=0.10, max_k=3),
