@@ -29,6 +29,9 @@ from monai.transforms import (
     Spacingd,
     RandRotate90d,
     ToTensord,
+    Lambdad,
+    RandScaleIntensityd,
+    RandShiftIntensityd,
     SpatialPadd,
 )
 from monai.transforms.transform import MapTransform
@@ -163,7 +166,13 @@ def init_worker(cfg: DictConfig):
         ScaleIntensityRanged(keys=["image"], a_min=cfg.dataset.a_min, a_max=cfg.dataset.a_max, b_min=cfg.dataset.b_min, b_max=cfg.dataset.b_max, clip=cfg.dataset.clip),
         SpatialPadd(keys=["image", "label"], spatial_size=(cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z), mode=["minimum", "constant"]),
         RandCropByPosNegLabeld(keys=["image", "label"], label_key="label", spatial_size=(cfg.dataset.roi_x, cfg.dataset.roi_y, cfg.dataset.roi_z), pos=10, neg=1, num_samples=cfg.producer.num_samples, image_key="image", image_threshold=-1),
+        RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.5),   # multiplicative ±10%
+        RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
         RandRotate90d(keys=["image", "label"], prob=0.10, max_k=3),
+        Lambdad(
+            keys=["image"], 
+            func=lambda x: torch.clamp(x, min=-1.0, max=1.0)
+        ),
         ToTensord(keys=["image", "label"]),
     ])
 
