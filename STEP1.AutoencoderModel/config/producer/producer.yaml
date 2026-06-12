@@ -1,6 +1,6 @@
 name: producer
-scratch_dir: "/scratch/rpinise1/MultiTumorSynthesis/AutoencoderCacheI2"
-num_workers: 10
+scratch_dir: "/scratch/rpinise1/MultiTumorSynthesis/AutoencoderCacheI4"
+num_workers: 5
 max_batches: 2500
 chunk_size: 256
 num_samples: 16

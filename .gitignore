@@ -30,6 +30,7 @@ debug_folder/
 debug_vis/
 *.nii.gz
 *.nii
+*.log
 
 # Pretrained weights
 pretrained_models/

@@ -53,7 +53,7 @@ def run(cfg: DictConfig, args=None):
     callbacks.append(ModelCheckpoint(every_n_train_steps=300, save_top_k=-1,
                      filename='{epoch}-{step}-10000-{train/recon_loss:.2f}'))
     callbacks.append(ImageLogger(
-        batch_frequency=100, max_images=4, clamp=True))
+        batch_frequency=1000, max_images=4, clamp=True))
     callbacks.append(LearningRateMonitor(logging_interval='epoch'))
 
     # load the most recent checkpoint file
