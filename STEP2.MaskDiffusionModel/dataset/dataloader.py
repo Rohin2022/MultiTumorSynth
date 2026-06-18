@@ -125,7 +125,7 @@ class ComputeTSDFd(MapTransform):
     Output is normalized between [-1, 1].
     """
 
-    def __init__(self, keys, truncation_distance=5.0, allow_missing_keys=False):
+    def __init__(self, keys, truncation_distance=4.0, allow_missing_keys=False):
         super().__init__(keys, allow_missing_keys)
         self.truncation_distance = truncation_distance
 
@@ -223,64 +223,57 @@ class Compose_Select(Compose):
                 _transform, input_, self.map_items, self.unpack_items, self.log_stats)
         return input_
 
-class GenerateBoundingBoxPrior(MapTransform):
+
+class GenerateTumorHeatmapd(MapTransform):
     """
-    Generates a 3D anisotropic Gaussian (ellipsoid) prior centered at the centroid.
-    Uses diameter_x, y, z_mm to scale the spread along each axis.
+    Calculates the center of mass of a binary mask and generates a 3D 
+    Gaussian heatmap centered on that point.
     """
 
-    def __init__(self, ref_key="tumor_mask", out_key="heatmap", 
-                 diameters=["diameter_x_mm", "diameter_y_mm", "diameter_z_mm"], 
-                 allow_missing_keys=False, spacing=(3.0,3.0,3.0)):
-        super().__init__([ref_key] + diameters, allow_missing_keys)
+    def __init__(self, ref_key="tumor_mask", out_key="heatmap", sigma=5.0, allow_missing_keys=False):
+        super().__init__([ref_key], allow_missing_keys)
         self.ref_key = ref_key
-        self.diameters = diameters
         self.out_key = out_key
-        self.spacing = spacing
+        self.sigma = sigma  # Controls how "wide" the target region is
 
     def __call__(self, data):
         d = dict(data)
         mask = d[self.ref_key]
-        
-        mask_tensor = mask if isinstance(mask, torch.Tensor) else torch.tensor(mask)
+
+        # Ensure it's a tensor for fast math
+        mask_tensor = mask if isinstance(
+            mask, torch.Tensor) else torch.tensor(mask)
+
+        # Assuming shape is [Channel, X, Y, Z]
         binary_mask = (mask_tensor[0] > 0).float()
         indices = torch.nonzero(binary_mask)
 
         if len(indices) == 0:
-            d[self.out_key] = torch.zeros_like(mask_tensor)
-            return d
+            # Fallback if no tumor is present (blank heatmap)
+            heatmap = torch.zeros_like(mask_tensor)
+        else:
+            # 1. Get exact X, Y, Z centroid
+            centroid = indices.float().mean(dim=0)
+            #print(f"CENTROID: {centroid}")
 
-        # 1. Calculate Centroid
-        centroid = indices.float().mean(dim=0)
+            # 2. Generate 3D grid
+            X, Y, Z = binary_mask.shape
+            x_grid, y_grid, z_grid = torch.meshgrid(
+                torch.arange(X, device=mask_tensor.device),
+                torch.arange(Y, device=mask_tensor.device),
+                torch.arange(Z, device=mask_tensor.device),
+                indexing='ij'
+            )
 
-        # 2. Calculate Sigmas from Diameters (convert mm to voxels)
-        # Assuming diameter = 4 * sigma (~95% of mass inside diameter)
-        # sigmas[i] = (diameter_mm[i] / spacing[i]) / 4
-        sigmas = []
-        for i, key in enumerate(self.diameters):
-            diam_mm = d[key]
-            sigma = (diam_mm / self.spacing[i]) / 4.0
-            # Ensure sigma isn't zero to avoid division issues
-            sigmas.append(max(sigma, 0.5)) 
+            # 3. Calculate Gaussian distance
+            dist_sq = (x_grid - centroid[0])**2 + (y_grid -
+                                                   centroid[1])**2 + (z_grid - centroid[2])**2
+            heatmap = torch.exp(-dist_sq / (2 * self.sigma**2))
 
-        # 3. Generate 3D grid
-        X, Y, Z = binary_mask.shape
-        x_grid, y_grid, z_grid = torch.meshgrid(
-            torch.arange(X, device=mask_tensor.device),
-            torch.arange(Y, device=mask_tensor.device),
-            torch.arange(Z, device=mask_tensor.device),
-            indexing='ij'
-        )
+            # Add channel dimension back -> [1, X, Y, Z]
+            heatmap = heatmap.unsqueeze(0)
 
-        # 4. Calculate Anisotropic Gaussian Distance
-        # G(x,y,z) = exp( - [ (x-cx)^2 / 2sx^2 + (y-cy)^2 / 2sy^2 + (z-cz)^2 / 2sz^2 ] )
-        dist_sq = ((x_grid - centroid[0])**2 / (2 * sigmas[0]**2)) + \
-                  ((y_grid - centroid[1])**2 / (2 * sigmas[1]**2)) + \
-                  ((z_grid - centroid[2])**2 / (2 * sigmas[2]**2))
-        
-        ellipsoid = torch.exp(-dist_sq)
-        d[self.out_key] = ellipsoid.unsqueeze(0)
-
+        d[self.out_key] = heatmap
         return d
 
 
@@ -306,8 +299,8 @@ def get_loader(args):
 
             # 3. GENERATE THE HEATMAP BEFORE CROPPING
             # You can adjust sigma. 5.0 means the "hotspot" radius is roughly 10-15 voxels wide
-            GenerateBoundingBoxPrior(ref_key="tumor_mask",
-                                  out_key="heatmap", spacing=(args.space_x, args.space_y, args.space_z)),
+            GenerateTumorHeatmapd(ref_key="tumor_mask",
+                                  out_key="heatmap", sigma=3.0),
 
             # 4. Crop and Augment (Heatmap gets sliced exactly like the masks)
             RandCropByLabelClassesd(
@@ -359,8 +352,11 @@ def get_loader(args):
             ),
 
             # Generates the heatmap on the newly cropped, smaller volume.
-            GenerateBoundingBoxPrior(ref_key="tumor_mask",
-                                  out_key="heatmap", spacing=(args.space_x, args.space_y, args.space_z)),
+            GenerateTumorHeatmapd(
+                ref_key="tumor_mask",
+                out_key="heatmap", 
+                sigma=8.0
+            ),
 
             # 2. CROP FOREGROUND FIRST 
             # Cut away the empty background before doing heavy math.
@@ -424,22 +420,6 @@ def get_loader(args):
             axis=1
         )
 
-
-        # Verify that all paths exist
-        from pathlib import Path
-
-        tumor = train_input["tumor_mask"].values
-        organ = train_input["organ_mask"].values
-
-        tumor_ok = [Path(p).exists() for p in tumor]
-        organ_ok = [Path(p).exists() for p in organ]
-
-        mask = [t and o for t, o in zip(tumor_ok, organ_ok)]
-
-        train_input = train_input.loc[mask].reset_index(drop=True)
-
-
-
         organ_mapping = {
             'spleen': 0,
             'bladder': 1,
@@ -456,16 +436,6 @@ def get_loader(args):
         train_input = train_input[train_input["organ"].isin(
             list(organ_mapping.keys()))]
         train_input = train_input[train_input["volume_ml"] > 0.0]
-
-        train_input = train_input[train_input["diameter_x_mm"]<(args.roi_x*args.space_x)]
-        train_input = train_input[train_input["diameter_y_mm"]<(args.roi_y*args.space_y)]
-        train_input = train_input[train_input["diameter_z_mm"]<(args.roi_z*args.space_z)]
-
-        train_input = train_input[
-            (train_input["diameter_x_mm"] >= args.space_x) & 
-            (train_input["diameter_y_mm"] >= args.space_y) & 
-            (train_input["diameter_z_mm"] >= args.space_z)
-        ]
 
         # 2. CALCULATE WEIGHTS FIRST (While volume_ml is still in true mL)
         vol_cutoff = float(train_input['volume_ml'].quantile(0.98))
@@ -493,9 +463,14 @@ def get_loader(args):
         import json
         from pandas.api.types import is_numeric_dtype
 
+        
+        train_input["num_components"] = train_input["num_components"].clip(upper=5)
+
+
         stats_file = "dataset_norm_stats.json"
         exclude_cols = ['volume_bin', 'sample_weight', 'organ',
-                        'tumor_mask', 'organ_mask', 'capped_volume', 'column_task','diameter_x_mm','diameter_y_mm','diameter_z_mm']
+                        'tumor_mask', 'organ_mask', 'capped_volume', 'column_task','num_components']
+
 
         if os.path.exists(stats_file):
             print("Loading existing normalization statistics...")
@@ -508,10 +483,26 @@ def get_loader(args):
                 if key in exclude_cols or not is_numeric_dtype(train_input[key]):
                     continue
 
+                values = train_input[key].copy()
+
+                is_skewed = values.skew() > args.skew_threshold
+                use_log = bool(args.apply_log_scale and is_skewed)
+
+                if use_log:
+                    print(f"SCALING: log transform applied to {key}")
+                    values = np.log1p(values)
+
                 normalization_stats[key] = {
-                    "mean": float(train_input[key].mean()),
-                    "std": float(train_input[key].std() + 1e-6)
+                    "mean": float(values.mean()),
+                    "std": float(values.std() + 1e-6),
+                    "log_scaled": use_log
                 }
+
+            normalization_stats["num_components"] = {
+                "mean": 0.0,
+                "std":5.0,
+                "log_scaled": False
+            }
 
             with open(stats_file, "w") as f:
                 json.dump(normalization_stats, f, indent=4)
@@ -520,15 +511,19 @@ def get_loader(args):
         # Apply the normalization (using loaded or newly generated stats)
         for key, stats in normalization_stats.items():
             if key in train_input.columns:
+                if(stats["log_scaled"]):
+                    train_input[key] = np.log1p(train_input[key])
+
                 train_input[key] = (train_input[key] -
                                     stats["mean"]) / stats["std"]
 
         # 5. CONVERT TO DICTIONARY RECORDS FOR MONAI
         data_dicts_train = train_input.to_dict("records")
-
-        #data_dicts_train = data_dicts_train[:10]
         print('train len {}'.format(len(data_dicts_train)))
 
+        persistent_cache_dir = os.path.join(
+            args.data_root_path, "monai_persistent_cache")
+        os.makedirs(persistent_cache_dir, exist_ok=True)
 
         train_dataset = Dataset(
             data=data_dicts_train, transform=train_transforms)

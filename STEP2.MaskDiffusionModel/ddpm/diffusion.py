@@ -1158,16 +1158,11 @@ class Trainer(object):
             if self.step > 0 and self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-# ==========================================
-            # 3. DEBUG: GENERATE AND SAVE NIFTI MASKS
-            # ==========================================
-            if self.step > 0 and self.step % self.update_ema_every == 0:
-                self.step_ema()
 
             # ==========================================
             # 3. DEBUG: GENERATE AND SAVE NIFTI MASKS
             # ==========================================
-            if self.step % 500 == 0:
+            if self.step % 2000 == 0:
                 print(
                     f"--> [Step {self.step}] Generating debug NIfTI reconstructions...")
                 self.ema_model.eval()
@@ -1228,6 +1223,8 @@ class Trainer(object):
                                 volume=""
                                 for key in metrics.keys():
                                     unnormalized_conditioner = data[key][b_idx].item() * normalized_stats[key]["std"] + normalized_stats[key]["mean"]
+                                    if(normalized_stats[key]["log_scaled"]):
+                                        unnormalized_conditioner = np.expm1(unnormalized_conditioner)
                                     print(f"SAMPLE 1: \n {key}: \ndelta = {abs(unnormalized_conditioner-metrics[key])}\n")
                                     print("================")
                                     if(key=="volume_ml"):
