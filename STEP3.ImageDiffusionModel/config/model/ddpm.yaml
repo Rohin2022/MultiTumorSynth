@@ -7,8 +7,8 @@ diffusion_num_channels: 17 # 1 + 2 * vqgan embed_dim
 out_dim: 8 # vqgan embed_dim
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/ddpm/
-results_folder_postfix: 'tumor_diffusion_v3'
-load_milestone: True
+results_folder_postfix: 'tumor_diffusion_v5'
+load_milestone: False
 
 batch_size: 4 # 40
 num_workers: 16

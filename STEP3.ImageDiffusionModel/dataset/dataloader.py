@@ -28,6 +28,7 @@ from monai.transforms import (
     CenterSpatialCropd,
     Resized,
     SpatialPadd,
+    CastToTyped,
     apply_transform,
     RandZoomd,
     RandCropByLabelClassesd,
@@ -177,7 +178,7 @@ class AugDataset(torch.utils.data.Dataset):
 def get_loader(args):
     train_transforms_deterministic = Compose(
         [
-            LoadImageh5d(keys=["image", "tumor_mask", "organ_mask"]),  # 0
+            LoadImageh5d(keys=["image", "tumor_mask", "organ_mask"]),
             EnsureChannelFirstd(keys=["image", "tumor_mask", "organ_mask"]),
             CombineMasksToTernaryd(
                 organ_key="organ_mask", tumor_key="tumor_mask", output_key="label"),
@@ -186,7 +187,7 @@ def get_loader(args):
                 keys=["image", "label"],
                 pixdim=(args.space_x, args.space_y, args.space_z),
                 mode=("bilinear", "nearest"),
-            ),  # process h5 to here
+            ),
             ScaleIntensityRanged(
                 keys=["image"],
                 a_min=args.a_min,
@@ -195,13 +196,20 @@ def get_loader(args):
                 b_max=args.b_max,
                 clip=True,
             ),
+            CropForegroundd(
+                keys=["image", "label"],
+                source_key="label",
+                select_fn=lambda x: x > 0,
+                margin=64,
+                allow_smaller=False,
+            ),
             SpatialPadd(keys=["image", "label"], spatial_size=(
                 args.roi_x, args.roi_y, args.roi_z), mode='constant'),
             ToTensord(keys=["image", "label"]),
-            SelectItemsd(keys=["image","label","attenuation_mean", "attenuation_stdev", "attenuation_delta", # attenuation_delta is (mean_tumor - mean_organ) / std_organ
+            CastToTyped(keys=["label"], dtype=np.uint8),
+            SelectItemsd(keys=["image","label","attenuation_mean", "attenuation_stdev", "attenuation_delta",
             "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
             "glcm_contrast", "glcm_autocorrelation", "glcm_idm", "num_components","organ"])
-            # KeepOnlyTensorsd(keys=["image", "label"])
         ]
     )
 

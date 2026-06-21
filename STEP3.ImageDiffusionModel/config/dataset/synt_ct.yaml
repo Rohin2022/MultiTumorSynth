@@ -27,4 +27,4 @@ roi_z: 128
 num_samples: 3
 phase: train
 persistent_cache: True
-persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/TumorDiffusionModel
+persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/TumorDiffusionModelV4
