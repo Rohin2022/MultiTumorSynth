@@ -1124,21 +1124,26 @@ class Trainer(object):
             # =======================================================
             # Periodic Inference (Runs every 1000 steps)
             # =======================================================
-            if self.step % 1000 == 0:
+            if self.step % 2000 == 0:
                 print(f"\n--- Running inference at step {self.step} ---")
-                self.model.eval() # Switch to eval mode for inference
+                self.ema_model.eval() # Switch to eval mode for inference
                 
                 with torch.no_grad():
                     vqgan = self.model.vqgan
-                    batch_size = image.shape[0]
+                    n_samples = min(3, image.shape[0])  # CHANGED: cap sample count up front
                     cond_scale = 3.0 # Default CFG scale from your script
                     
+                    # CHANGED: slice everything to the first n_samples before any compute
+                    image_s = image[:n_samples]
+                    mask_s = mask[:n_samples]
+                    tabular_cond_s = tabular_cond[:n_samples] if tabular_cond is not None else None
+                    
                     # 1. Build Spatial Conditioning for Diffusion
-                    mask_bg = (1 - mask).detach()
-                    masked_img = (image * mask_bg).detach()
+                    mask_bg = (1 - mask_s).detach()
+                    masked_img = (image_s * mask_bg).detach()
                     
                     masked_img_p = masked_img.permute(0, 1, 4, 2, 3)
-                    mask_p = mask.permute(0, 1, 4, 2, 3)
+                    mask_p = mask_s.permute(0, 1, 4, 2, 3)
                     
                     emb_min = vqgan.codebook.embeddings.min()
                     emb_max = vqgan.codebook.embeddings.max()
@@ -1150,8 +1155,7 @@ class Trainer(object):
                     cc = F.interpolate(
                         mask_p * 2.0 - 1.0, 
                         size=latent_n.shape[-3:], 
-                        mode='trilinear', 
-                        align_corners=False
+                        mode='nearest'
                     )
                     spatial_cond = torch.cat([latent_n, cc], dim=1)
                     latent_shape = latent_n.shape
@@ -1159,13 +1163,14 @@ class Trainer(object):
                     # 2. Reverse Diffusion in Latent Space
                     noisy_latent = torch.randn(latent_shape, device=self.device)
                     
-                    for i in tqdm(reversed(range(self.model.num_timesteps)), desc=f"Sampling cfg={cond_scale}", leave=False):
-                        t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
-                        noisy_latent = self.model.p_sample(
+                    for i in tqdm(reversed(range(self.ema_model.num_timesteps)), desc=f"Sampling cfg={cond_scale}", leave=False):
+                        t = torch.full((n_samples,), i, device=self.device, dtype=torch.long)  # CHANGED: n_samples instead of batch_size
+                        noisy_latent = self.ema_model.p_sample(
                             noisy_latent, t,
                             cond=spatial_cond,
-                            tabular_cond=tabular_cond,
-                            cond_scale=cond_scale
+                            tabular_cond=tabular_cond_s,  # CHANGED: sliced tabular cond
+                            cond_scale=cond_scale,
+                            clip_denoised=False
                         )
                         
                     # 3. Decode Diffusion Latent to CT
@@ -1176,7 +1181,7 @@ class Trainer(object):
                     # ---------------------------------------------------
                     # NEW: VQGAN Autoencode (Original Image In & Out)
                     # ---------------------------------------------------
-                    image_p = image.permute(0, 1, 4, 2, 3) # Permute to VQGAN shape
+                    image_p = image_s.permute(0, 1, 4, 2, 3) # Permute to VQGAN shape  # CHANGED: image_s
                     latent_orig = vqgan.encode(image_p, quantize=False, include_embeddings=True)
                     decoded_orig = vqgan.decode(latent_orig, quantize=True)
                     ct_vqgan_recon = decoded_orig.permute(0, 1, 3, 4, 2).contiguous()
@@ -1192,11 +1197,11 @@ class Trainer(object):
                     
                     # Move tensors to CPU and convert to NumPy
                     ct_np = ct_synth.cpu().numpy()
-                    mask_np = mask.cpu().numpy()
-                    orig_ct_np = image.cpu().numpy()
+                    mask_np = mask_s.cpu().numpy()  # CHANGED: mask_s
+                    orig_ct_np = image_s.cpu().numpy()  # CHANGED: image_s
                     vqgan_recon_np = ct_vqgan_recon.cpu().numpy()
                     
-                    for b in range(min(3,batch_size)):
+                    for b in range(n_samples):  # CHANGED: no need to re-min() against batch_size
                         # Extract 3D volumes
                         ct_3d = ct_np[b, 0]
                         mask_3d = mask_np[b, 0]
@@ -1213,10 +1218,9 @@ class Trainer(object):
                         nib.save(nib.Nifti1Image(orig_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_original_ct.nii.gz"))
                         #nib.save(nib.Nifti1Image(vqgan_3d.astype(np.float32), affine), str(debug_folder / f"{stem}_vqgan_recon_ct.nii.gz"))
                         
-                self.model.train() # Switch back to training mode
+                #self.ema_model.train() # Switch back to training mode
                 print("--- Inference complete, resuming training ---\n")
             # =======================================================
-
             
             log_fn(log)
             self.step += 1

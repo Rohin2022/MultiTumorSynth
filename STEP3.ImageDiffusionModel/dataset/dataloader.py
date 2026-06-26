@@ -371,7 +371,7 @@ def get_loader(args):
         import json
         from pandas.api.types import is_numeric_dtype
 
-        stats_file = "dataset_norm_stats.json"
+        stats_file = f"dataset_norm_stats_{args.results_folder_postfix}.json"
         exclude_cols = ['volume_bin', 'sample_weight', 'organ',
                         'tumor_mask', 'organ_mask', 'capped_volume', 'column_task', 'image', 'label',
                         'diameter_x_mm', 'diameter_y_mm', 'diameter_z_mm', 'volume_ml',

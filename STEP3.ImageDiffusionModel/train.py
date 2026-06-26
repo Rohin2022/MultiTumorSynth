@@ -39,6 +39,8 @@ def run(cfg: DictConfig):
         loss_type=cfg.model.loss_type,
     ).cuda()
 
+    
+
     train_dataloader, train_sampler, dataset_size = get_loader(cfg.dataset)
 
     val_dataloader=None
