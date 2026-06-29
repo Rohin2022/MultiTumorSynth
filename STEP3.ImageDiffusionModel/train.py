@@ -19,7 +19,7 @@ def run(cfg: DictConfig):
 
     if cfg.model.denoising_fn == 'Unet3D':
         model = Unet3D(
-            dim=cfg.model.diffusion_img_size,
+            dim=cfg.model.unet_dim,
             dim_mults=cfg.model.dim_mults,
             channels=cfg.model.diffusion_num_channels, # image (1) and tumor mask (1)
             out_dim=cfg.model.out_dim,

@@ -855,48 +855,45 @@ class GaussianDiffusion(nn.Module):
         return loss
 
     def forward(self, img, mask, tabular_cond, textual_cond=None, null_cond_prob=0.10, *args, **kwargs):
-        # 1. Create masks and detached masked images
-        mask_ = (1 - mask).detach()
-        masked_img = (img * mask_).detach()
-        
-        # 2. Permute dimensions (Consider using explicit positive indices instead of -1, -3, -2)
-        masked_img = masked_img.permute(0, 1, -1, -3, -2)
-        img = img.permute(0, 1, -1, -3, -2)
-        mask = mask.permute(0, 1, -1, -3, -2)
+        # 1. Extract binary tumor mask from ternary {0,1,2}
+        tumor_mask = (mask == 2).float().detach()   # {0,1} binary, tumor region only
+        mask_ = (1 - tumor_mask).detach()           # 1=keep, 0=zero-out tumor region
+        masked_img = (img * mask_).detach()         # CT with tumor region zeroed out
 
-        # 3. Process through VQGAN or standard normalization safely
+        # 2. Permute from (B, C, H, W, D) → (B, C, D, H, W) for VQGAN
+        masked_img  = masked_img.permute(0, 1, 4, 2, 3)
+        img = img.permute(0, 1, 4, 2, 3)
+        tumor_mask  = tumor_mask.permute(0, 1, 4, 2, 3)
+
+        # 3. Encode through VQGAN and normalize with codebook min/max
         if isinstance(self.vqgan, VQGAN):
             with torch.no_grad():
-                # Cache min/max to avoid recalculating 4 times
-                emb_min = self.vqgan.codebook.embeddings.min()
-                emb_max = self.vqgan.codebook.embeddings.max()
+                emb_min   = self.vqgan.codebook.embeddings.min()
+                emb_max   = self.vqgan.codebook.embeddings.max()
                 emb_denom = emb_max - emb_min
 
-                # Encode
-                img = self.vqgan.encode(img, quantize=False, include_embeddings=True)
+                img        = self.vqgan.encode(img,        quantize=False, include_embeddings=True)
                 masked_img = self.vqgan.encode(masked_img, quantize=False, include_embeddings=True)
-                
-                # Normalize
-                img = ((img - emb_min) / emb_denom) * 2.0 - 1.0
+
+                img        = ((img        - emb_min) / emb_denom) * 2.0 - 1.0
                 masked_img = ((masked_img - emb_min) / emb_denom) * 2.0 - 1.0
         else:
             raise RuntimeError("PLEASE USE VQGAN")
-            # Wrap in no_grad to prevent tracking gradients on detached tensors
-            with torch.no_grad():
-                img = normalize_img(img)
-                masked_img = normalize_img(masked_img)
-            
-        # 4. Condition preparation
-        mask = mask * 2.0 - 1.0
-        cc = torch.nn.functional.interpolate(mask, size=masked_img.shape[-3:])
+
+        # 4. Build spatial conditioning
+        cc = torch.nn.functional.interpolate(
+            tumor_mask * 2.0 - 1.0,        # {0,1} → {-1,1} ✅
+            size=masked_img.shape[-3:],
+            mode='nearest'
+        )
         cond = torch.cat((masked_img, cc), dim=1)
 
-        # 5. Timestep sampling and loss calculation
+        # 5. Timestep sampling and loss
         b, device = img.shape[0], img.device
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
-        
+
         return self.p_losses(
-            img, t, cond=cond, tabular_cond=tabular_cond, 
+            img, t, cond=cond, tabular_cond=tabular_cond,
             null_cond_prob=null_cond_prob, *args, **kwargs
         )
 
@@ -1126,35 +1123,36 @@ class Trainer(object):
             # =======================================================
             if self.step % 2000 == 0:
                 print(f"\n--- Running inference at step {self.step} ---")
-                self.ema_model.eval() # Switch to eval mode for inference
+                self.ema_model.eval()
                 
                 with torch.no_grad():
                     vqgan = self.model.vqgan
-                    n_samples = min(3, image.shape[0])  # CHANGED: cap sample count up front
-                    cond_scale = 3.0 # Default CFG scale from your script
+                    n_samples = min(3, image.shape[0])
+                    cond_scale = 3.0
                     
-                    # CHANGED: slice everything to the first n_samples before any compute
                     image_s = image[:n_samples]
-                    mask_s = mask[:n_samples]
+                    mask_s  = mask[:n_samples]
                     tabular_cond_s = tabular_cond[:n_samples] if tabular_cond is not None else None
                     
                     # 1. Build Spatial Conditioning for Diffusion
-                    mask_bg = (1 - mask_s).detach()
-                    masked_img = (image_s * mask_bg).detach()
+                    # Extract binary tumor mask from ternary {0,1,2} — matches forward()
+                    tumor_mask = (mask_s == 2).float().detach()
+                    mask_      = (1 - tumor_mask).detach()
+                    masked_img = (image_s * mask_).detach()
                     
                     masked_img_p = masked_img.permute(0, 1, 4, 2, 3)
-                    mask_p = mask_s.permute(0, 1, 4, 2, 3)
+                    tumor_mask_p = tumor_mask.permute(0, 1, 4, 2, 3)
                     
-                    emb_min = vqgan.codebook.embeddings.min()
-                    emb_max = vqgan.codebook.embeddings.max()
+                    emb_min   = vqgan.codebook.embeddings.min()
+                    emb_max   = vqgan.codebook.embeddings.max()
                     emb_denom = emb_max - emb_min
                     
-                    latent = vqgan.encode(masked_img_p, quantize=False, include_embeddings=True)
+                    latent   = vqgan.encode(masked_img_p, quantize=False, include_embeddings=True)
                     latent_n = ((latent - emb_min) / emb_denom) * 2.0 - 1.0
                     
                     cc = F.interpolate(
-                        mask_p * 2.0 - 1.0, 
-                        size=latent_n.shape[-3:], 
+                        tumor_mask_p * 2.0 - 1.0,   # {0,1} → {-1,1} ✅
+                        size=latent_n.shape[-3:],
                         mode='nearest'
                     )
                     spatial_cond = torch.cat([latent_n, cc], dim=1)

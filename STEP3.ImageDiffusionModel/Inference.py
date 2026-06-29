@@ -95,7 +95,7 @@ def build_spatial_cond(image, mask, vqgan, device):
     # Inputs from the dataloader are (B, C, X, Y, Z)
     image = image.to(device)
     mask  = mask.to(device)
-
+    mask = (mask==2).float()
     # 1. Zero out the tumor region in the CT (the part the model must synthesise)
     mask_bg     = (1 - mask).detach()
     masked_img  = (image * mask_bg).detach()
@@ -118,8 +118,7 @@ def build_spatial_cond(image, mask, vqgan, device):
         cc = F.interpolate(
             mask_p * 2.0 - 1.0,
             size=latent_n.shape[-3:],
-            mode='trilinear',
-            align_corners=False,
+            mode='nearest',
         )   # (B, 1, Z', X', Y')
 
         # 5. Concatenate — matches training: cond = cat([masked_img, cc], dim=1)
@@ -244,6 +243,7 @@ def generate_samples(data, step, diffusion, vqgan, norm_stats, a_min, a_max, con
                 cond=spatial_cond,
                 tabular_cond=tabular_cond,
                 cond_scale=cond_scale,
+                clip_denoised=False
             )
 
         # ---- decode ----
@@ -359,7 +359,7 @@ def reconstruct(cfg: DictConfig):
     # Same z-score stats file written by get_loader() during training, and
     # the same HU clip window (a_min/a_max) passed to ScaleIntensityRanged —
     # both needed to denormalize generated CT / attenuation targets back to HU.
-    norm_stats = load_norm_stats(f"dataset_norm_stats_{args.results_folder_postfix}.json")
+    norm_stats = load_norm_stats(f"dataset_norm_stats_{cfg.model.results_folder_postfix}.json")
     a_min = cfg.dataset.a_min
     a_max = cfg.dataset.a_max
 

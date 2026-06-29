@@ -4,10 +4,11 @@ vqgan_ckpt: 'pretrained_models/UCSF_V7_133k_250kSTEPS_recon_loss=0.09.ckpt'
 diffusion_img_size: 32
 diffusion_depth_size: 32
 diffusion_num_channels: 17 # 1 + 2 * vqgan embed_dim
+unet_dim: 128
 out_dim: 8 # vqgan embed_dim
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/ddpm/
-results_folder_postfix: 'tumor_diffusion_v8'
+results_folder_postfix: 'tumor_diffusion_v9'
 load_milestone: False
 
 batch_size: 8 # 40
@@ -17,10 +18,10 @@ objective: pred_x0
 save_and_sample_every: 1000
 denoising_fn: Unet3D
 train_lr: 1e-4
-timesteps: 4 # number of steps
-sampling_timesteps: 4 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
+timesteps: 100 # number of steps
+sampling_timesteps: 100 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
 loss_type: l1 # L1 or L2
-train_num_steps: 120000 # total training steps
+train_num_steps: 60000 # total training steps
 gradient_accumulate_every: 1 # gradient accumulation steps
 ema_decay: 0.995 # exponential moving average decay
 amp: True # turn on mixed precision
