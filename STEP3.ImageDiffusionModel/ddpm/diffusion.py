@@ -196,39 +196,40 @@ class Block(nn.Module):
     def forward(self, x, scale_shift=None):
         x = self.proj(x)
         x = self.norm(x)
-
         if exists(scale_shift):
             scale, shift = scale_shift
             x = x * (scale + 1) + shift
-
         return self.act(x)
 
 
 class ResnetBlock(nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
         super().__init__()
+        # one shared projection of the fused (time + tabular) embedding,
+        # producing scale/shift for BOTH blocks -> 4*dim_out total
         self.mlp = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_emb_dim, dim_out * 2)
+            nn.Linear(time_emb_dim, dim_out * 4)
         ) if exists(time_emb_dim) else None
+
+        
 
         self.block1 = Block(dim, dim_out, groups=groups)
         self.block2 = Block(dim_out, dim_out, groups=groups)
-        self.res_conv = nn.Conv3d(
-            dim, dim_out, 1) if dim != dim_out else nn.Identity()
+        self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
 
     def forward(self, x, time_emb=None):
-
-        scale_shift = None
+        scale_shift1 = scale_shift2 = None
         if exists(self.mlp):
             assert exists(time_emb), 'time emb must be passed in'
-            time_emb = self.mlp(time_emb)
-            time_emb = rearrange(time_emb, 'b c -> b c 1 1 1')
-            scale_shift = time_emb.chunk(2, dim=1)
+            emb = self.mlp(time_emb)
+            emb = rearrange(emb, 'b c -> b c 1 1 1')
+            scale1, shift1, scale2, shift2 = emb.chunk(4, dim=1)
+            scale_shift1 = (scale1, shift1)
+            scale_shift2 = (scale2, shift2)
 
-        h = self.block1(x, scale_shift=scale_shift)
-
-        h = self.block2(h)
+        h = self.block1(x, scale_shift=scale_shift1)
+        h = self.block2(h, scale_shift=scale_shift2)
         return h + self.res_conv(x)
 
 
@@ -439,9 +440,6 @@ class Unet3D(nn.Module):
             nn.Linear(time_dim, time_dim)
         )
 
-        #nn.init.zeros_(self.cond_mlp[-1].weight)
-        #nn.init.zeros_(self.cond_mlp[-1].bias)
-
 
         # text conditioning
         '''
@@ -541,10 +539,10 @@ class Unet3D(nn.Module):
 
         drop_mask = torch.rand(batch, device=device) < null_cond_prob
 
-        if exists(cond):
-            spatial_mask = drop_mask.view(batch, 1, 1, 1, 1)
-            cond = torch.where(spatial_mask, torch.zeros_like(cond), cond)
-            x = torch.cat([x, cond], dim=1)
+        #if exists(cond):
+        #    spatial_mask = drop_mask.view(batch, 1, 1, 1, 1)
+        #    cond = torch.where(spatial_mask, torch.zeros_like(cond), cond)
+        x = torch.cat([x, cond], dim=1)
 
         focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
             (batch,), prob_focus_present, device=device))
