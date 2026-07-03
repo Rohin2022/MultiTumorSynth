@@ -8,7 +8,7 @@ unet_dim: 128
 out_dim: 8 # vqgan embed_dim
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/ddpm/
-results_folder_postfix: 'tumor_diffusion_v12' # v11 10 steps, v10 100 steps
+results_folder_postfix: 'tumor_diffusion_v13' # v11 10 steps, v10 100 steps
 load_milestone: False
 
 batch_size: 8 # 40
@@ -18,8 +18,8 @@ objective: pred_x0
 save_and_sample_every: 1000
 denoising_fn: Unet3D
 train_lr: 1e-4
-timesteps: 25 # number of steps
-sampling_timesteps: 25 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
+timesteps: 10 # number of steps
+sampling_timesteps: 10 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
 loss_type: l1 # L1 or L2
 train_num_steps: 100000 # total training steps
 gradient_accumulate_every: 1 # gradient accumulation steps
