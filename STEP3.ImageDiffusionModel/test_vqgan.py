@@ -55,7 +55,7 @@ def describe(name, t):
     )
 
 
-@hydra.main(config_path='config', config_name='base_cfg', version_base=None)
+@hydra.main(config_path='config', config_name='inference', version_base=None)
 def main(cfg: DictConfig):
     torch.cuda.set_device(cfg.model.gpus)
     device = torch.device(f"cuda:{cfg.model.gpus}")
@@ -106,7 +106,7 @@ def main(cfg: DictConfig):
         recon_continuous = vqgan.decode(latent, quantize=False)
         recon_continuous = recon_continuous.permute(0, 1, 3, 4, 2).contiguous()
 
-    print("\n--- Stats ---")
+    print("\n--- Global Stats ---")
     describe("original image", image)
     describe("recon_quantized", recon_quantized)
     describe("recon_continuous", recon_continuous)
@@ -116,32 +116,46 @@ def main(cfg: DictConfig):
     describe("abs diff (quantized)", diff_q)
     describe("abs diff (continuous)", diff_c)
 
-    # ---- Save NIfTIs for visual inspection ----
-    spacing = (1.0, 1.0, 1.0)
-    affine = np.diag([*spacing, 1.0])
-
+    # ------------------------------------------------------------------
+    # Tumor attenuation statistics
+    # ------------------------------------------------------------------
+    mask = batch["label"].to(device)   # change key if your dataloader uses a different name
+    print("\n--- Tumor Attenuation Statistics ---")
     batch_size = image.shape[0]
+
     for b in range(batch_size):
-        stem = f"sample{b}"
+        tumor = mask[b, 0] > 1.0
 
-        nib.save(
-            nib.Nifti1Image(image[b, 0].cpu().numpy().astype(np.float32), affine),
-            str(out_dir / f"{stem}_original.nii.gz"),
-        )
-        nib.save(
-            nib.Nifti1Image(recon_quantized[b, 0].cpu().numpy().astype(np.float32), affine),
-            str(out_dir / f"{stem}_recon_quantized.nii.gz"),
-        )
-        nib.save(
-            nib.Nifti1Image(recon_continuous[b, 0].cpu().numpy().astype(np.float32), affine),
-            str(out_dir / f"{stem}_recon_continuous.nii.gz"),
-        )
+        n_vox = tumor.sum().item()
+        if n_vox == 0:
+            print(f"Sample {b}: no tumor voxels found.")
+            continue
 
-    print(f"\nSaved {batch_size} sample(s) to {out_dir.resolve()}")
-    print("\nCompare *_original vs *_recon_quantized vs *_recon_continuous in your NIfTI viewer.")
-    print("  - Both noisy            -> autoencoder/codebook itself is the problem (STEP1)")
-    print("  - Only quantized noisy  -> quantization/codebook-snap step is the problem")
-    print("  - Both clean            -> VQGAN is fine, noise comes from diffusion sampling")
+        gt_vals = image[b, 0][tumor]
+        q_vals = recon_quantized[b, 0][tumor]
+        c_vals = recon_continuous[b, 0][tumor]
+
+        print(f"\nSample {b} ({n_vox} tumor voxels)")
+        print(
+            f"  Ground Truth : mean={gt_vals.mean():8.3f}  "
+            f"std={gt_vals.std():8.3f}"
+        )
+        print(
+            f"  Quantized    : mean={q_vals.mean():8.3f}  "
+            f"std={q_vals.std():8.3f}"
+        )
+        print(
+            f"  Continuous   : mean={c_vals.mean():8.3f}  "
+            f"std={c_vals.std():8.3f}"
+        )
+        print(
+            f"  |Δmean| (Q)  ={abs(q_vals.mean()-gt_vals.mean()):8.3f}   "
+            f"|Δstd|={abs(q_vals.std()-gt_vals.std()):8.3f}"
+        )
+        print(
+            f"  |Δmean| (C)  ={abs(c_vals.mean()-gt_vals.mean()):8.3f}   "
+            f"|Δstd|={abs(c_vals.std()-gt_vals.std()):8.3f}"
+        )
 
 
 if __name__ == '__main__':

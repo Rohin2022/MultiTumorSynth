@@ -192,7 +192,7 @@ class Block(nn.Module):
         self.proj = nn.Conv3d(dim, dim_out, (1, 3, 3), padding=(0, 1, 1))
         self.norm = nn.GroupNorm(groups, dim_out)
         self.act = nn.SiLU()
-
+ 
     def forward(self, x, scale_shift=None):
         x = self.proj(x)
         x = self.norm(x)
@@ -200,24 +200,23 @@ class Block(nn.Module):
             scale, shift = scale_shift
             x = x * (scale + 1) + shift
         return self.act(x)
-
-
+ 
+ 
 class ResnetBlock(nn.Module):
     def __init__(self, dim, dim_out, *, time_emb_dim=None, groups=8):
         super().__init__()
-        # one shared projection of the fused (time + tabular) embedding,
-        # producing scale/shift for BOTH blocks -> 4*dim_out total
+        # time_emb_dim is now the dim of the CONCATENATED [t, tab_emb]
+        # vector, not t alone. One shared projection produces scale/shift
+        # for BOTH blocks -> 4*dim_out total, same as before.
         self.mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(time_emb_dim, dim_out * 4)
         ) if exists(time_emb_dim) else None
-
-        
-
+ 
         self.block1 = Block(dim, dim_out, groups=groups)
         self.block2 = Block(dim_out, dim_out, groups=groups)
         self.res_conv = nn.Conv3d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
+ 
     def forward(self, x, time_emb=None):
         scale_shift1 = scale_shift2 = None
         if exists(self.mlp):
@@ -227,7 +226,7 @@ class ResnetBlock(nn.Module):
             scale1, shift1, scale2, shift2 = emb.chunk(4, dim=1)
             scale_shift1 = (scale1, shift1)
             scale_shift2 = (scale2, shift2)
-
+ 
         h = self.block1(x, scale_shift=scale_shift1)
         h = self.block2(h, scale_shift=scale_shift2)
         return h + self.res_conv(x)
@@ -382,42 +381,45 @@ class Unet3D(nn.Module):
         use_sparse_linear_attn=True,
         block_type='resnet',
         resnet_groups=8,
-        num_organs = 9,
-        num_continuous_conditioners=10
+        num_organs=9,
+        num_continuous_conditioners=10,
+        tabular_emb_dim=None,   # NEW: size of the tabular embedding before concat.
+                                 # Defaults to time_dim // 2 below if not given —
+                                 # tune this; it's now an independent hyperparameter
+                                 # instead of being forced to match time_dim.
     ):
         super().__init__()
         self.channels = channels
-
+ 
         # temporal attention and its relative positional encoding
-
+ 
         rotary_emb = RotaryEmbedding(min(32, attn_dim_head))
-
+ 
         def temporal_attn(dim): return EinopsToAndFrom('b c f h w', 'b (h w) f c', Attention(
             dim, heads=attn_heads, dim_head=attn_dim_head, rotary_emb=rotary_emb))
-
-        # realistically will not be able to generate that many frames of video... yet
+ 
         self.time_rel_pos_bias = RelativePositionBias(
             heads=attn_heads, max_distance=32)
-
+ 
         # initial conv
-
+ 
         init_dim = default(init_dim, dim)
         assert is_odd(init_kernel_size)
-
+ 
         init_padding = init_kernel_size // 2
         self.init_conv = nn.Conv3d(channels, init_dim, (1, init_kernel_size,
                                    init_kernel_size), padding=(0, init_padding, init_padding))
-
+ 
         self.init_temporal_attn = Residual(
             PreNorm(init_dim, temporal_attn(init_dim)))
-
+ 
         # dimensions
-
+ 
         dims = [init_dim, *map(lambda m: dim * m, dim_mults)]
         in_out = list(zip(dims[:-1], dims[1:]))
-
+ 
         # time conditioning
-
+ 
         time_dim = dim * 4
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(dim),
@@ -425,49 +427,48 @@ class Unet3D(nn.Module):
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
-
+ 
         self.num_organs = num_organs
-        # diameters, volumes, means, stds
         self.num_continuous_conditioners = num_continuous_conditioners
-
         self.tabular_cond_dim = self.num_organs + self.num_continuous_conditioners
-
-        # Total input to the MLP is now: 9 (one-hot organ) + 10 (continuous) = 19
+ 
+        # Tabular embedding is now sized independently of time_dim — it no
+        # longer has to "win" a shared additive channel, it just needs to
+        # carry enough information for the concat + shared FiLM-MLP inside
+        # each ResnetBlock to route it into per-block scale/shift. Default
+        # to time_dim // 2 as a reasonable starting point; treat as a
+        # tunable hyperparameter.
+        self.tabular_emb_dim = default(tabular_emb_dim, time_dim // 2)
+ 
         self.tabular_cond_mlp = nn.Sequential(
-            nn.Linear(self.tabular_cond_dim, time_dim),
+            nn.Linear(self.tabular_cond_dim, self.tabular_emb_dim),
             nn.SiLU(),
-            nn.LayerNorm(time_dim),
-            nn.Linear(time_dim, time_dim)
+            nn.LayerNorm(self.tabular_emb_dim),
+            nn.Linear(self.tabular_emb_dim, self.tabular_emb_dim)
         )
-
-
-        # text conditioning
-        '''
-        self.has_cond = exists(cond_dim) or use_bert_text_cond
-        cond_dim = BERT_MODEL_DIM if use_bert_text_cond else cond_dim
-
-        
-
-        cond_dim = time_dim + int(cond_dim or 0)'''
-
+ 
         self.tabular_null_cond_emb = nn.Parameter(
             torch.randn(1, self.tabular_cond_dim))
-
+ 
+        # This is the dim every ResnetBlock's FiLM-MLP now expects —
+        # concatenated [t, tab_emb], not t alone.
+        fused_emb_dim = time_dim + self.tabular_emb_dim
+ 
         # layers
-
+ 
         self.downs = nn.ModuleList([])
         self.ups = nn.ModuleList([])
-
+ 
         num_resolutions = len(in_out)
         # block type
-
+ 
         block_klass = partial(ResnetBlock, groups=resnet_groups)
-        block_klass_cond = partial(block_klass, time_emb_dim=time_dim)
-
+        block_klass_cond = partial(block_klass, time_emb_dim=fused_emb_dim)
+ 
         # modules for all layers
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
-
+ 
             self.downs.append(nn.ModuleList([
                 block_klass_cond(dim_in, dim_out),
                 block_klass_cond(dim_out, dim_out),
@@ -476,22 +477,22 @@ class Unet3D(nn.Module):
                 Residual(PreNorm(dim_out, temporal_attn(dim_out))),
                 Downsample(dim_out) if not is_last else nn.Identity()
             ]))
-
+ 
         mid_dim = dims[-1]
         self.mid_block1 = block_klass_cond(mid_dim, mid_dim)
-
+ 
         spatial_attn = EinopsToAndFrom(
             'b c f h w', 'b f (h w) c', Attention(mid_dim, heads=attn_heads))
-
+ 
         self.mid_spatial_attn = Residual(PreNorm(mid_dim, spatial_attn))
         self.mid_temporal_attn = Residual(
             PreNorm(mid_dim, temporal_attn(mid_dim)))
-
+ 
         self.mid_block2 = block_klass_cond(mid_dim, mid_dim)
-
+ 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind >= (num_resolutions - 1)
-
+ 
             self.ups.append(nn.ModuleList([
                 block_klass_cond(dim_out * 2, dim_in),
                 block_klass_cond(dim_in, dim_in),
@@ -500,13 +501,18 @@ class Unet3D(nn.Module):
                 Residual(PreNorm(dim_in, temporal_attn(dim_in))),
                 Upsample(dim_in) if not is_last else nn.Identity()
             ]))
-
+ 
         out_dim = default(out_dim, channels)
+        # NOTE: final_conv's Block still takes time_emb_dim implicitly via
+        # block_klass (not block_klass_cond) below, so it is UNCONDITIONED
+        # on time/tabular — same as your original code. Flagging only
+        # because it's easy to assume every block is conditioned; this one
+        # isn't, and that isn't new to this patch.
         self.final_conv = nn.Sequential(
             block_klass(dim * 2, dim),
             nn.Conv3d(dim, out_dim, 1)
         )
-
+ 
     def forward_with_cond_scale(
         self,
         *args,
@@ -518,10 +524,10 @@ class Unet3D(nn.Module):
             kwargs.get('cond') is None and kwargs.get('tabular_cond') is None
         ):
             return logits
-
+ 
         null_logits = self.forward(*args, null_cond_prob=1., **kwargs)
         return null_logits + (logits - null_logits) * cond_scale
-
+ 
     def forward(
         self,
         x,
@@ -531,49 +537,60 @@ class Unet3D(nn.Module):
         textual_cond_embed=None,
         null_cond_prob=0.10,
         focus_present_mask=None,
-        # probability at which a given batch sample will focus on the present (0. is all off, 1. is completely arrested attention across time)
         prob_focus_present=0.
     ):
-
+ 
         batch, device = x.shape[0], x.device
-
+ 
         drop_mask = torch.rand(batch, device=device) < null_cond_prob
-
+ 
         #if exists(cond):
         #    spatial_mask = drop_mask.view(batch, 1, 1, 1, 1)
         #    cond = torch.where(spatial_mask, torch.zeros_like(cond), cond)
         x = torch.cat([x, cond], dim=1)
-
+ 
         focus_present_mask = default(focus_present_mask, lambda: prob_mask_like(
             (batch,), prob_focus_present, device=device))
-
+ 
         time_rel_pos_bias = self.time_rel_pos_bias(x.shape[2], device=x.device)
-
+ 
         x = self.init_conv(x)
         r = x.clone()
-
+ 
         x = self.init_temporal_attn(x, pos_bias=time_rel_pos_bias)
-
+ 
         t = self.time_mlp(time)
-
-        # classifier free guidance
-
+ 
+        # classifier free guidance — tabular conditioning is now CONCATENATED
+        # with t, not added into it. Every downstream block receives the
+        # fused vector and the per-block FiLM-MLP learns how to split its
+        # attention between "what timestep am I at" and "what attenuation
+        # was requested" instead of the two competing inside one shared
+        # additive channel.
         if exists(tabular_cond):
             emb_mask = drop_mask.view(batch, 1)
-
-            # Replace input with null embedding BEFORE passing through MLP
+ 
             tabular_cond = torch.where(
                 emb_mask.bool(),
                 self.tabular_null_cond_emb.expand(batch, -1),
                 tabular_cond
             )
-
-            # Now project to time_dim space
+ 
             tab_emb = self.tabular_cond_mlp(tabular_cond)
-            t = t + tab_emb
+            t = torch.cat([t, tab_emb], dim=-1)
 
+            print("t std:", t.std().item(), "tab_emb std:", tab_emb.std().item())
+            
+        else:
+            # Keep dims consistent even when tabular_cond isn't provided
+            # (e.g. an ablation run) — pad with zeros rather than letting
+            # ResnetBlock's Linear(fused_emb_dim, ...) receive the wrong
+            # shape and crash.
+            zeros = torch.zeros(batch, self.tabular_emb_dim, device=device, dtype=t.dtype)
+            t = torch.cat([t, zeros], dim=-1)
+ 
         h = []
-        
+ 
         for block1, block2, spatial_attn, temporal_attn, downsample in self.downs:
             x = block1(x, t)
             x = block2(x, t)
@@ -582,13 +599,13 @@ class Unet3D(nn.Module):
                               focus_present_mask=focus_present_mask)
             h.append(x)
             x = downsample(x)
-
-        x = self.mid_block1(x, t) 
+ 
+        x = self.mid_block1(x, t)
         x = self.mid_spatial_attn(x)
         x = self.mid_temporal_attn(
             x, pos_bias=time_rel_pos_bias, focus_present_mask=focus_present_mask)
         x = self.mid_block2(x, t)
-
+ 
         for block1, block2, spatial_attn, temporal_attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim=1)
             x = block1(x, t)
@@ -597,7 +614,7 @@ class Unet3D(nn.Module):
             x = temporal_attn(x, pos_bias=time_rel_pos_bias,
                               focus_present_mask=focus_present_mask)
             x = upsample(x)
-
+ 
         x = torch.cat((x, r), dim=1)
         return self.final_conv(x)
 
@@ -732,6 +749,7 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, tabular_cond=None, textual_cond_embed=None, cond_scale=1.):
+        print(tabular_cond)
         x_recon = self.predict_start_from_noise(
             x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond_embed, cond_scale=cond_scale))
 

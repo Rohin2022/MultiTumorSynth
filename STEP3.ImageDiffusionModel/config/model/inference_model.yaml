@@ -9,9 +9,9 @@ out_dim: 8 # vqgan embed_dim
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/ddpm/
 results_folder_postfix: 'tumor_diffusion_v14' # v11 10 steps, v10 100 steps
-load_milestone: True
+load_milestone: False
 
-batch_size: 8 # 40
+batch_size: 4 # 40
 num_workers: 16
 logger: wandb
 objective: pred_x0

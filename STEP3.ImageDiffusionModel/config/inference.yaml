@@ -1,0 +1,3 @@
+defaults:
+  - dataset: inference_dataset.yaml 
+  - model: inference_model.yaml
