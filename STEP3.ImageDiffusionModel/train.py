@@ -1,7 +1,8 @@
 from re import I
 import sys, os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.append(os.getcwd())
-from ddpm import Unet3D, GaussianDiffusion, Trainer
+from ddpm import Unet3D, GaussianDiffusion, Trainer, Unet3D_CA
 import hydra
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
@@ -26,8 +27,29 @@ def run(cfg: DictConfig):
             num_continuous_conditioners=10,
             num_organs=9
         ).cuda()
+    elif cfg.model.denoising_fn == 'Unet3D_CA':
+        x_channels = cfg.model.out_dim
+        cond_channels = cfg.model.diffusion_num_channels - cfg.model.out_dim
+
+        model = Unet3D_CA(
+            dim=cfg.model.unet_dim,
+            dim_mults=cfg.model.dim_mults,
+            channels=x_channels,
+            out_dim=cfg.model.out_dim,
+            num_continuous_conditioners=10,
+            num_organs=9,
+            cond_channels=cond_channels,
+            num_res_blocks=2,
+            attention_resolutions=(2, 4, 8),
+            num_heads=8,
+            # dim_head removed -- now computed internally as ch // num_heads
+            # at every resolution level, matching source's legacy=True behavior
+        ).cuda()
     else:
         raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")
+
+
+
 
     diffusion = GaussianDiffusion(
         model,
@@ -59,6 +81,7 @@ def run(cfg: DictConfig):
         num_sample_rows=cfg.model.num_sample_rows,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
+        max_grad_norm=5.0
     )
 
     if cfg.model.load_milestone:

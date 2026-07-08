@@ -579,7 +579,6 @@ class Unet3D(nn.Module):
             tab_emb = self.tabular_cond_mlp(tabular_cond)
             t = torch.cat([t, tab_emb], dim=-1)
 
-            print("t std:", t.std().item(), "tab_emb std:", tab_emb.std().item())
             
         else:
             # Keep dims consistent even when tabular_cond isn't provided
@@ -749,9 +748,8 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def p_mean_variance(self, x, t, clip_denoised: bool, cond=None, tabular_cond=None, textual_cond_embed=None, cond_scale=1.):
-        print(tabular_cond)
         x_recon = self.predict_start_from_noise(
-            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, textual_cond_embed=textual_cond_embed, cond_scale=cond_scale))
+            x, t=t, noise=self.denoise_fn.forward_with_cond_scale(x, t, cond=cond, tabular_cond=tabular_cond, cond_scale=cond_scale))
 
         if clip_denoised:
             s = 1.
@@ -859,7 +857,7 @@ class GaussianDiffusion(nn.Module):
                 tokenize(textual_cond), return_cls_repr=self.text_use_bert_cls)
             textual_cond_embed = textual_cond_embed.to(device)
 
-        x_recon = self.denoise_fn(x_noisy, t, cond=cond, tabular_cond=tabular_cond, textual_cond_embed = textual_cond_embed, null_cond_prob=null_cond_prob, **kwargs)
+        x_recon = self.denoise_fn(x_noisy, t, cond=cond, tabular_cond=tabular_cond, null_cond_prob=null_cond_prob, **kwargs)
 
         if self.loss_type == 'l1':
             loss = F.l1_loss(noise, x_recon)
@@ -1076,67 +1074,101 @@ class Trainer(object):
     ):
         assert callable(log_fn)
         best_train_loss = 0.90
+
+        loss_history = []
+
         while self.step < self.train_num_steps:
+            skip_step = False
+
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl)
-                
+
                 image = data['image'].to(self.device)
                 mask = data['label'].to(self.device)
-                #mask[mask==1]=0
-                #mask[mask==2]=1
 
-                tabular_cond = self.prepare_conditional_vector(
-                    data, device=self.device)
+                tabular_cond = self.prepare_conditional_vector(data, device=self.device)
 
-                with autocast(enabled=self.amp):
+                # -- diagnostics, logged regardless of whether we skip --
+                tab_max = tabular_cond.abs().max().item()
+                tab_argmax = tabular_cond.abs().view(-1).argmax().item()
+                img_max = image.abs().max().item()
+                sample_ids = data.get('bdmap_id', None)  # adjust key to match your dataset
+
+                with autocast(enabled=self.amp, dtype=torch.bfloat16):
                     loss = self.model(
-                        image, 
+                        image,
                         mask,
                         tabular_cond,
-                        textual_cond=None,
-                        prob_focus_present=prob_focus_present,
-                        focus_present_mask=focus_present_mask,
                         null_cond_prob=0.1
                     )
 
-                    self.scaler.scale(
-                        loss / self.gradient_accumulate_every).backward()
+                loss_val = loss.item()
 
-                if(self.step%10==0):
-                    print(f'{self.step}: {loss.item()}')
+                is_nonfinite = not torch.isfinite(loss)
+                is_spike = False
+                median = float('nan')
+                if len(loss_history) >= 50:
+                    median = torch.tensor(loss_history[-50:]).median().item()
+                    is_spike = loss_val > median * 5
 
-            log = {'loss': loss.item()}
+                if is_nonfinite or is_spike:
+                    reason = "non-finite" if is_nonfinite else "spike"
+                    print(f"[step {self.step}] {reason} loss {loss_val:.4f} "
+                        f"(recent median {median:.4f}) -- skipping. "
+                        f"tab_max={tab_max:.3f} (feature idx {tab_argmax}), "
+                        f"img_max={img_max:.3f}, sample_ids={sample_ids}")
+                    self.writer.add_scalar('Skipped_batch/loss', loss_val, self.step)
+                    self.writer.add_scalar('Skipped_batch/tabular_max', tab_max, self.step)
+                    self.writer.add_scalar('Skipped_batch/image_max', img_max, self.step)
+                    self.opt.zero_grad(set_to_none=True)
+                    skip_step = True
+                    break  # abandon remaining grad-accumulation micro-batches this step
 
+                loss.backward()
+
+                if self.step % 10 == 0:
+                    print(f'{self.step}: {loss_val}')
+
+            if skip_step:
+                self.step += 1
+                log_fn({'loss': loss_val, 'skipped': True})
+                continue  # this now continues the OUTER while loop --
+                        # correctly skips opt.step, EMA, checkpointing, inference
+
+            # -- only reached if no micro-batch this step was skipped --
+            log = {'loss': loss_val}
+
+            grad_norm = None
             if exists(self.max_grad_norm):
-                self.scaler.unscale_(self.opt)
-                nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.max_grad_norm)
+                grad_norm = nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-            self.scaler.step(self.opt)
-            self.scaler.update()
+            loss_history.append(loss_val)
+            if len(loss_history) > 100:
+                loss_history = loss_history[-75:]
+
+            self.opt.step()
             self.opt.zero_grad()
 
             lr = self.opt.state_dict()['param_groups'][0]['lr']
-            self.writer.add_scalar('Train_Loss', loss.item(), self.step)
+            self.writer.add_scalar('Train_Loss', loss_val, self.step)
             self.writer.add_scalar('Learning_rate', lr, self.step)
+            self.writer.add_scalar('Tabular_max', tab_max, self.step)
+            self.writer.add_scalar('Image_max', img_max, self.step)
+            if grad_norm is not None:
+                self.writer.add_scalar('Grad_norm', grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm, self.step)
 
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
-            # 1. Only check for "Best" during a milestone to save disk I/O
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every
-                self.save(milestone) # Save the periodic checkpoint
+                self.save(milestone)
 
-                # 2. Check if this milestone is also the best version so far
-                if loss.item() < best_train_loss:
-                    best_train_loss = loss.item()
+                if loss_val < best_train_loss:
+                    best_train_loss = loss_val
                     self.save('model_best')
                     print(f'New best model found at step {self.step}')
-                    
-            # =======================================================
-            # Periodic Inference (Runs every 1000 steps)
-            # =======================================================
+
             if self.step % 2000 == 0:
                 print(f"\n--- Running inference at step {self.step} ---")
                 self.ema_model.eval()

@@ -209,7 +209,7 @@ def get_loader(args):
             CastToTyped(keys=["label"], dtype=np.uint8),
             SelectItemsd(keys=["image","label","attenuation_mean", "attenuation_stdev", "attenuation_delta",
             "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
-            "glcm_contrast", "glcm_autocorrelation", "glcm_idm", "num_components","organ"])
+            "glcm_contrast", "glcm_autocorrelation", "glcm_idm", "num_components","organ", "bdmap_id"])
         ]
     )
 
