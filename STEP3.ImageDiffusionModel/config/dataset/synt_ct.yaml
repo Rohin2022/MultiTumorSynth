@@ -9,7 +9,7 @@ organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro
 tumor_csv_path: cross_eval/
 tumor_datafile: tumor_metrics_v1.csv
 tumor_masks_datafile: RadiomicsMaskMetricsBadDropped_Train.csv
-results_folder_postfix: 'tumor_diffusion_v15'
+results_folder_postfix: 'tumor_diffusion_vTEST'
 
 dist: False
 batch_size: 8
@@ -28,4 +28,4 @@ roi_z: 128
 num_samples: 2
 phase: train
 persistent_cache: True
-persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/TumorDiffusionModelV15
+persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/TumorDiffusionModelvTEST

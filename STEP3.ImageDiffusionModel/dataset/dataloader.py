@@ -402,6 +402,7 @@ def get_loader(args):
             if key in train_input.columns:
                 train_input[key] = (train_input[key] -
                                     stats["mean"]) / stats["std"]
+                train_input[key] = train_input[key].clip(lower=-3,upper=3)
 
         # 5. CONVERT TO DICTIONARY RECORDS FOR MONAI
         data_dicts_train = train_input.to_dict("records")

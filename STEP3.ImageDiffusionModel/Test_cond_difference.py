@@ -119,7 +119,7 @@ def test_diff(cfg: DictConfig):
 
     tab_b = torch.zeros(1, tab_dim, device=device)
     tab_b[0, 4] = 1.0          # organ class 4
-    tab_b[0, 9:] = 2.0         # continuous features shifted +2 std
+    tab_b[0, 9:] = 4.0         # continuous features shifted +2 std
 
     print("tab_a:", tab_a)
     print("tab_b:", tab_b)

@@ -7,7 +7,7 @@ from functools import partial
 
 from torch.utils import data
 from pathlib import Path
-from torch.optim import Adam
+from torch.optim import AdamW
 from torchvision import transforms as T, utils
 from torch.cuda.amp import autocast, GradScaler
 from PIL import Image
@@ -22,6 +22,8 @@ from torch.utils.data import Dataset, DataLoader
 from vq_gan_3d.model.vqgan import VQGAN
 
 import matplotlib.pyplot as plt
+
+from ddpm.cross_attention_unet import CrossAttention
 
 def exists(x):
     return x is not None
@@ -971,8 +973,24 @@ class Trainer(object):
         self.dl = cycle(dl)
 
         self.device = "cuda" if torch.cuda.is_available() else ""
-        
-        self.opt = Adam(diffusion_model.parameters(), lr=train_lr)
+                
+        decay, no_decay = [], []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if param.ndim <= 1 or name.endswith('.bias') or 'norm' in name.lower():
+                no_decay.append(param)
+            else:
+                decay.append(param)
+
+        print(f"Parameters with decay: {len(decay)}, Parameters withOUT decay: {len(no_decay)}")
+
+        self.opt = AdamW([
+            {'params': decay, 'weight_decay': 1e-4},
+            {'params': no_decay, 'weight_decay': 0.0},
+        ], lr=train_lr)
+
+
         self.step = 0
 
         self.amp = amp
@@ -1087,7 +1105,7 @@ class Trainer(object):
                 mask = data['label'].to(self.device)
 
                 tabular_cond = self.prepare_conditional_vector(data, device=self.device)
-
+                
                 # -- diagnostics, logged regardless of whether we skip --
                 tab_max = tabular_cond.abs().max().item()
                 tab_argmax = tabular_cond.abs().view(-1).argmax().item()
@@ -1120,14 +1138,17 @@ class Trainer(object):
                     self.writer.add_scalar('Skipped_batch/loss', loss_val, self.step)
                     self.writer.add_scalar('Skipped_batch/tabular_max', tab_max, self.step)
                     self.writer.add_scalar('Skipped_batch/image_max', img_max, self.step)
-                    self.opt.zero_grad(set_to_none=True)
-                    skip_step = True
-                    break  # abandon remaining grad-accumulation micro-batches this step
+                    #self.opt.zero_grad(set_to_none=True)
+                    #skip_step = True
+                    #break  # abandon remaining grad-accumulation micro-batches this step
 
                 loss.backward()
 
                 if self.step % 10 == 0:
                     print(f'{self.step}: {loss_val}')
+                    for name, module in self.model.named_modules():
+                        if isinstance(module, CrossAttention) and hasattr(module, 'last_entropy'):
+                            self.writer.add_scalar(f'attn_entropy/{name}', module.last_entropy.item(), self.step)
 
             if skip_step:
                 self.step += 1

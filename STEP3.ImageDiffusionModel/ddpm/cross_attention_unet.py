@@ -100,14 +100,22 @@ class CrossAttention(nn.Module):
         self.heads = heads
 
         self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        
+        # Excellent fix here on your part for the context_dim handling
         if context_dim is None:
             self.to_k = nn.Linear(query_dim, inner_dim, bias=False)
             self.to_v = nn.Linear(query_dim, inner_dim, bias=False)
         else:
-            self.to_k = nn.Linear(1, inner_dim, bias=False)
-            self.to_v = nn.Linear(1, inner_dim, bias=False)
+            self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+            self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+            
         self.to_k_self = nn.Linear(query_dim, inner_dim, bias=False)
         self.to_v_self = nn.Linear(query_dim, inner_dim, bias=False)
+
+        # --- CORRECTED: QK-Normalization Layers ---
+        # Applied to dim_head, not inner_dim
+        self.q_norm = nn.LayerNorm(dim_head, elementwise_affine=False)
+        self.k_norm = nn.LayerNorm(dim_head, elementwise_affine=False)
 
         self.to_out = nn.Sequential(
             nn.Linear(inner_dim, query_dim),
@@ -118,22 +126,22 @@ class CrossAttention(nn.Module):
         h = self.heads
         q = self.to_q(x)
         context = default(context, x)
+        
         if context.shape[1] == 1:
-            # Null-conditioning fallback: a single dummy token globally
-            # triggers self-attention (to_k_self/to_v_self on x itself)
-            # instead of routing through to_k/to_v. This is a per-forward-call
-            # decision (whole batch is either "real" or "null"), matching the
-            # source repo's dataset-duplication approach: individual batches
-            # end up with a stochastic mix over training, without needing
-            # mismatched context shapes within one batch.
             k = self.to_k_self(x)
             v = self.to_v_self(x)
         else:
             k = self.to_k(context)
             v = self.to_v(context)
 
+        # 1. Split into multi-head format FIRST
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
+        # 2. Apply QK-Normalization PER-HEAD
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 3. Calculate Similarity
         sim = torch.einsum('b i d, b j d -> b i j', q, k) * self.scale
 
         if exists(mask):
@@ -144,10 +152,14 @@ class CrossAttention(nn.Module):
 
         attn = sim.softmax(dim=-1)
 
+        if self.training:
+            with torch.no_grad():
+                ent = -(attn * (attn + 1e-9).log()).sum(-1).mean()
+                self.last_entropy = ent.detach()
+
         out = torch.einsum('b i j, b j d -> b i d', attn, v)
         out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
         return self.to_out(out)
-
 
 class BasicTransformerBlock(nn.Module):
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True):
@@ -456,7 +468,7 @@ class Unet3D_CA(nn.Module):
             zero_module(conv_nd(dim, self.out_channels, 3, padding=1)),
         )
 
-    def forward(self, x, t, cond=None, tabular_cond=None, null_cond_prob=0.0, tabular_clamp=5.0):
+    def forward(self, x, t, cond=None, tabular_cond=None, null_cond_prob=0.0):
         if self.cond_channels > 0:
             assert cond is not None, "cond_channels > 0 but no cond tensor was passed"
             x = torch.cat([x, cond], dim=1)
@@ -493,7 +505,7 @@ class Unet3D_CA(nn.Module):
             # glcm_contrast) can otherwise produce one outlier key/value that
             # destabilizes the softmax. This clamp is a no-op for
             # well-behaved samples and only affects rare outliers.
-            tabular_cond = tabular_cond.clamp(-tabular_clamp, tabular_clamp)
+            #tabular_cond = tabular_cond.clamp(-tabular_clamp, tabular_clamp)
             context = tabular_cond.unsqueeze(-1)
 
         hs = []

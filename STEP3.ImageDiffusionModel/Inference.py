@@ -7,7 +7,7 @@ import torch
 from omegaconf import DictConfig, open_dict
 import hydra
 import os
-from ddpm import Unet3D, GaussianDiffusion, ResnetBlock
+from ddpm import Unet3D, GaussianDiffusion, ResnetBlock, Unet3D_CA
 from pathlib import Path
 from tqdm import tqdm
 
@@ -288,6 +288,46 @@ def decode_latent(latent, vqgan):
     decoded = decoded.permute(0, 1, 3, 4, 2).contiguous()   # (B, C, X, Y, Z)
     return decoded
 
+def get_denormalized_radiomics(data, idx, norm_stats):
+    """
+    Extracts the radiomics conditioning values for one sample and
+    converts them back from z-score normalized space to raw values.
+    """
+    numerical_features = [
+        "attenuation_mean", "attenuation_stdev", "attenuation_delta",
+        "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
+        "glcm_contrast", "glcm_autocorrelation", "glcm_idm",
+        "num_components",
+    ]
+
+    record = {}
+
+    for key in numerical_features:
+        # normalized value from dataloader
+        value = data[key][idx]
+
+        # convert torch tensor -> python float
+        if torch.is_tensor(value):
+            value = value.detach().cpu().item()
+
+        # undo z-score normalization
+        record[key] = float(
+            denormalize_feature(
+                value,
+                key,
+                norm_stats
+            )
+        )
+
+    # organ is categorical; keep original value
+    organ = data["organ"][idx]
+    if torch.is_tensor(organ):
+        organ = organ.detach().cpu().item()
+
+    record["organ"] = int(organ)
+
+    return record
+
 
 def generate_samples(data, step, diffusion, vqgan, norm_stats, a_min, a_max, cond_scale=2.0):
     """
@@ -374,12 +414,22 @@ def generate_samples(data, step, diffusion, vqgan, norm_stats, a_min, a_max, con
             target_mean=gt_mean,
             target_std=gt_std,
         )
+        radiomics_record = get_denormalized_radiomics(
+            data,
+            b,
+            norm_stats
+        )
+
         atten_stats.update({
             "step": step,
             "sample": b,
             "cond_scale": cond_scale,
             "floor_mean": floor_records[b]["floor_mean"],
             "floor_std": floor_records[b]["floor_std"],
+            "filename": f"step{step:04d}_b{b}_cfg{cond_scale}",
+
+            # denormalized conditioning values
+            **radiomics_record,
         })
         # std error relative to the VQGAN compression floor, when available
         if atten_stats["gen_std"] is not None and atten_stats["floor_std"] is not None and gt_std is not None:
@@ -450,14 +500,35 @@ def reconstruct(cfg: DictConfig):
 
     # ---- Diffusion model (VQGAN bundled via vqgan_ckpt, loaded from checkpoint) ----
     print("1. Initializing diffusion model...")
-    model = Unet3D(
-        dim=cfg.model.unet_dim,
-        dim_mults=cfg.model.dim_mults,
-        channels=cfg.model.diffusion_num_channels,
-        out_dim=cfg.model.out_dim,
-        num_organs=9,
-        num_continuous_conditioners=10,
-    ).to(device)
+    if cfg.model.denoising_fn == 'Unet3D':
+        model = Unet3D(
+            dim=cfg.model.unet_dim,
+            dim_mults=cfg.model.dim_mults,
+            channels=cfg.model.diffusion_num_channels, # image (1) and tumor mask (1)
+            out_dim=cfg.model.out_dim,
+            num_continuous_conditioners=10,
+            num_organs=9
+        ).cuda()
+    elif cfg.model.denoising_fn == 'Unet3D_CA':
+        x_channels = cfg.model.out_dim
+        cond_channels = cfg.model.diffusion_num_channels - cfg.model.out_dim
+
+        model = Unet3D_CA(
+            dim=cfg.model.unet_dim,
+            dim_mults=cfg.model.dim_mults,
+            channels=x_channels,
+            out_dim=cfg.model.out_dim,
+            num_continuous_conditioners=10,
+            num_organs=9,
+            cond_channels=cond_channels,
+            num_res_blocks=2,
+            attention_resolutions=(2, 4, 8),
+            num_heads=8,
+            # dim_head removed -- now computed internally as ch // num_heads
+            # at every resolution level, matching source's legacy=True behavior
+        ).cuda()
+    else:
+        raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")
 
 
     diffusion = GaussianDiffusion(

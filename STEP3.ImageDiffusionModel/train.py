@@ -81,7 +81,7 @@ def run(cfg: DictConfig):
         num_sample_rows=cfg.model.num_sample_rows,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
-        max_grad_norm=5.0
+        max_grad_norm=2.0
     )
 
     if cfg.model.load_milestone:
