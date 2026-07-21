@@ -46,12 +46,10 @@ def run(cfg: DictConfig, args=None):
 
     model = VQGAN(cfg)
     get_parameter_number(model)
-    save_step = 500
+    save_step = 5000
     callbacks = []
     callbacks.append(ModelCheckpoint(every_n_train_steps=save_step,
                      save_top_k=-1, filename='{epoch}-{step}-{train/recon_loss:.2f}'))
-    callbacks.append(ModelCheckpoint(every_n_train_steps=300, save_top_k=-1,
-                     filename='{epoch}-{step}-10000-{train/recon_loss:.2f}'))
     callbacks.append(ImageLogger(
         batch_frequency=1000, max_images=4, clamp=True))
     callbacks.append(LearningRateMonitor(logging_interval='epoch'))
@@ -66,7 +64,7 @@ def run(cfg: DictConfig, args=None):
             ckpt_folder = os.path.join(base_dir, log_folder, 'checkpoints')
             if os.path.exists(ckpt_folder):
                 ckpts = sorted(
-                    glob.glob(os.path.join(ckpt_folder, '*.ckpt')),
+                    glob.glob(os.path.join(ckpt_folder, "*", "*.ckpt")),
                     key=os.path.getmtime
                 )
                 if ckpts:
@@ -112,7 +110,7 @@ def run(cfg: DictConfig, args=None):
         precision=cfg.model.precision,
     )
 
-    trainer.fit(model, train_dataloader, val_dataloader, ckpt_path=ckpt_path)
+    trainer.fit(model, train_dataloader, val_dataloader, ckpt_path=ckpt_path, weights_only=None if ckpt_path is None else False)
 
 
 if __name__ == '__main__':

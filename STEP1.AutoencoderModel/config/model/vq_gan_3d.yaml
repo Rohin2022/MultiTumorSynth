@@ -5,8 +5,8 @@ gpus: 4
 accumulate_grad_batches: 1
 default_root_dir: checkpoints/vq_gan/
 default_root_dir_postfix: 'abdomen_atlas_140k_v7'
-resume: False
-resume_version: 0
+resume: True
+resume_version: 2
 resume_from_checkpoint: ~
 pretrained_checkpoint: ~
 max_steps: 300000 # MUST BE DOUBLED -> lightning global step is doubled because of two optimizer.step calls

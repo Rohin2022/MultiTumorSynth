@@ -110,12 +110,17 @@ class VQGAN(pl.LightningModule):
                 return vq_output['encodings']
         return h
 
+
     def decode(self, latent, quantize=False):
         if quantize:
             vq_output = self.codebook(latent)
             latent = vq_output['encodings']
-        h = F.embedding(latent, self.codebook.embeddings)
-        h = self.post_vq_conv(shift_dim(h, -1, 1))
+            h = F.embedding(latent, self.codebook.embeddings)
+            h = self.post_vq_conv(shift_dim(h, -1, 1))  # needs shift: (B,Z,X,Y,emb) → (B,emb,Z,X,Y)
+        else:
+            # include_embeddings=True already returns (B, emb_dim, Z, X, Y)
+            # shift_dim would wrongly move Y → channel position, giving wrong shape
+            h = self.post_vq_conv(latent)  # pass directly, no shift needed
         return self.decoder(h)
 
 
