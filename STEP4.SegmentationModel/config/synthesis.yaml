@@ -1,0 +1,127 @@
+# --------------------------------------------------------------------------- #
+# Tumor generation inference pipeline config
+#
+# Load with: cfg = load_config("config.yaml")   (see utils.py)
+# Then:      mask_tester  = prepare_mask_model(device, cfg)
+#            tumor_tester = prepare_tumor_model(device, cfg)
+#
+# Only keys actually read by prepare_mask_model / prepare_tumor_model are
+# listed here — architecture params that are hardcoded in those functions
+# (mask: dim=64, out_dim=1, num_organs=9; tumor: num_organs=9, num_res_blocks=2,
+# attention_resolutions=(2,4,8), num_heads=8) are intentionally NOT
+# configurable and are omitted.
+# --------------------------------------------------------------------------- #
+
+paths:
+  # Directory containing the diffusion checkpoints:
+  #   - mask_model.checkpoint_name  (mask diffusion weights)
+  #   - tumor_model.checkpoint_name (tumor diffusion weights, single
+  #     organ-agnostic model)
+  tumor_diffusion_ckpt_dir: /projects/bodymaps/Rohin/TumorSynthesis/STEP3.ImageDiffusionModel/checkpoints/ddpm/multi_tumor_train/tumor_diffusion_all_radiomics_500tsteps_UnetCA_128dim
+
+  mask_diffusion_ckpt_dir: /projects/bodymaps/Rohin/TumorSynthesis/STEP2ACTUAL.MaskDiffusionModel/checkpoints/multi_tumor_train/mask_diffusion_all_radiomics_500tsteps_32size_4space_64dim_actual
+
+  # Pickled, unified per-organ GMM + preprocessing bundle (trained on the full
+  # feature set per organ). See radiomics_sampler.utils:
+  # synthesize_organ_radiomics / split_tumor_shape_features, which split each
+  # sample into MASK_COLUMNS vs TUMOR_COLUMNS subsets at inference time.
+  radiomics_gmm_bank: /projects/bodymaps/Rohin/TumorSynthesis/STEP4.SegmentationModel/TumorGeneration/radiomics_sampler/gmm_bank.pkl
+
+
+dataset:
+  tumor_norm_stats: /projects/bodymaps/Rohin/TumorSynthesis/STEP3.ImageDiffusionModel/dataset_norm_stats_tumor_diffusion_all_radiomics_500tsteps_UnetCA_128dim.json
+  mask_norm_stats: /projects/bodymaps/Rohin/TumorSynthesis/STEP2ACTUAL.MaskDiffusionModel/dataset_norm_stats.json
+
+
+  dataset_list: abdomen_atlas_pro
+  data_root_path: /projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/
+  organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
+  tumor_csv_path: cross_eval/
+  tumor_datafile: healthy_dataset.csv
+
+  dist: false
+  batch_size: 1
+  num_workers: 16
+
+  a_min: -1000
+  a_max: 500
+  b_min: -1.0
+  b_max: 1.0
+
+  space_x: 1.0
+  space_y: 1.0
+  space_z: 1.0
+
+  m_space_x: 4.0
+  m_space_y: 4.0
+  m_space_z: 4.0
+
+
+  m_roi_x: 32
+  m_roi_y: 32
+  m_roi_z: 32
+
+
+  roi_x: 128
+  roi_y: 128
+  roi_z: 128
+
+  num_samples: 1
+
+  persistent_cache: true
+  persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/segmentation_training_v1
+
+mask_model:
+  # Unet3D dim_mults (note: base dim is hardcoded to 64 in prepare_mask_model)
+  dim_mults: [1, 2, 4, 8]
+
+  # Total input channels to the Unet3D: target (1) + organ_mask (1) +
+  # heatmap (1). The mask model has NO VQGAN/latent conditioning channel —
+  # its spatial cond is just [organ_mask, heatmap] (see
+  # build_mask_spatial_cond / the reference mask inference script).
+  # (out_dim is hardcoded to 1 in prepare_mask_model.)
+  diffusion_num_channels: 3
+
+  # Diffusion / volume params. diffusion_img_size/diffusion_depth_size should
+  # match the `dim_size` you pass to generate_tumor_mask / synthesize_tumor
+  # (mask_dim_size) — the model's working resolution is a dim_size^3 cube.
+  diffusion_img_size: 32
+  diffusion_depth_size: 32
+  timesteps: 500
+  loss_type: l1
+
+  # Filename (relative to paths.diffusion_ckpt_dir) of the mask model checkpoint.
+  checkpoint_name: model_best.pt
+
+
+tumor_model:
+  # Unet3D_CA architecture params
+  unet_dim: 128
+  dim_mults: [1, 2, 4, 8]
+
+  # Total channels = target/x channels (out_dim) + conditioning channels.
+  # x_channels = out_dim, cond_channels = diffusion_num_channels - out_dim
+  # (both computed in prepare_tumor_model). cond_channels must equal your
+  # VQGAN's latent channel count (codebook embedding dim) + 1 (the
+  # downsampled tumor-mask channel) -- see build_tumor_spatial_cond.
+  diffusion_num_channels: 17
+  out_dim: 8
+
+  # Diffusion / volume params
+  diffusion_img_size: 32
+  diffusion_depth_size: 32
+  timesteps: 500
+  loss_type: l1
+
+  # VQGAN checkpoint used internally by this model's GaussianDiffusion (the
+  # tumor model is the only one that does latent diffusion / owns a VQGAN).
+  vqgan_ckpt: /projects/bodymaps/Rohin/TumorSynthesis/STEP3.ImageDiffusionModel/pretrained_models/UCSF_V7_133k_recon_loss=0.09.ckpt
+
+  # Filename (relative to paths.diffusion_ckpt_dir) of the single,
+  # organ-agnostic tumor model checkpoint (organ identity is conveyed via the
+  # one-hot tabular conditioning, not via separate per-organ checkpoints).
+  checkpoint_name: model_best.pt
+
+
+inference:
+  gpu_idxs: 0
