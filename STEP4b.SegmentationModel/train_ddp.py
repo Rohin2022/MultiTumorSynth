@@ -1,0 +1,1246 @@
+import builtins
+import logging
+import os
+import random
+import time
+import training.losses_foundation as lf
+from collections import OrderedDict
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import optim
+import numpy as np
+from model.utils import get_model
+from training.dataset.utils import get_dataset
+from torch.utils import data
+from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
+import torch.multiprocessing as mp
+#mp.set_sharing_strategy('file_system')
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data.distributed import DistributedSampler
+from training.dataset.dim3.sampler import ChunkedSampler
+from training.dataset.dim3.sampler_clip import one_organ_per_batch_sampler
+
+import HungarianAlgorithm as HA
+import gc
+
+
+from training.utils import update_ema_variables
+from training.validation import validation_ddp as validation
+from training.utils import (
+    exp_lr_scheduler_with_warmup, 
+    log_evaluation_result, 
+    get_optimizer, 
+    filter_validation_results,
+    unwrap_model_checkpoint,
+    save_checkpoint_atomic,
+)
+import yaml
+import argparse
+import time
+import math
+import sys
+import pdb
+import warnings
+import matplotlib.pyplot as plt
+import copy
+
+#multi-task learning methods
+from MTL.code.optim import *
+
+
+from utils import (
+    configure_logger,
+    save_configure,
+    is_master,
+    AverageMeter,
+    ProgressMeter,
+    resume_load_optimizer_checkpoint,
+    resume_load_model_checkpoint,
+)
+
+
+"""
+    python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name mask_only_model_name --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugDirV1 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_NPZ_V1 --epochs 100 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0
+    
+
+"""
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+counter_mg = 0
+
+
+def train_net(net, trainset, testset, args, ema_net=None, fold_idx=0):
+    
+    ########################################################################################
+    # Dataloader Creation
+    #train_sampler = DistributedSampler(trainset) if args.distributed else None
+    try:
+        leng = len(trainset.img_list)
+    except:
+        assert trainset.gigantic_length==False, 'You must set gigantic_length to False in the dataset if you want to use the dataloader with a sampler'
+        leng = trainset.__len__()
+    
+    if args.clip_pretrain:
+        train_sampler = one_organ_per_batch_sampler(
+            dataset_size=leng,#real size of the dataset
+            samples_per_epoch=args.iter_per_epoch*args.batch_size*args.ngpus_per_node,
+            shuffle=True,
+            seed=42,
+            rank=dist.get_rank() if args.distributed else 0,
+            world_size=dist.get_world_size() if args.distributed else 1,
+            dataset = trainset,
+            batch_size=args.batch_size_global)
+           
+        trainLoader = data.DataLoader(
+            trainset, 
+            batch_sampler=train_sampler,
+            pin_memory=(args.aug_device != 'gpu'),
+            num_workers=args.num_workers,
+            persistent_workers=(args.num_workers>0),
+        )
+    elif args.model_genesis_pretrain:
+        train_sampler = DistributedSampler(trainset) if args.distributed else None
+        trainLoader = data.DataLoader(
+            trainset, 
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            pin_memory=(args.aug_device != 'gpu'),
+            num_workers=args.num_workers,
+            persistent_workers=(args.num_workers>0),
+        )
+    else:
+        train_sampler = ChunkedSampler(
+            dataset_size=leng,#real size of the dataset
+            samples_per_epoch=args.iter_per_epoch*args.batch_size*args.ngpus_per_node,
+            shuffle=True,
+            seed=42,
+            rank=dist.get_rank() if args.distributed else 0,
+            world_size=dist.get_world_size() if args.distributed else 1)
+        
+        trainLoader = data.DataLoader(
+            trainset, 
+            batch_size=args.batch_size,
+            shuffle=False,
+            sampler=train_sampler,
+            pin_memory=(args.aug_device != 'gpu'),
+            num_workers=args.num_workers,
+            persistent_workers=(args.num_workers>0),
+        )
+    
+    test_sampler = DistributedSampler(testset) if args.distributed else None
+    testLoader = data.DataLoader(
+        testset,
+        batch_size=1,  # has to be 1 sample per gpu, as the input size of 3D input is different
+        shuffle=(test_sampler is None), 
+        sampler=test_sampler,
+        pin_memory=True,
+        num_workers=args.num_workers
+    )
+    
+    logging.info(f"Created Dataset and DataLoader")
+
+    ########################################################################################
+    # Initialize tensorboard, optimizer, amp scaler and etc.
+    writer = SummaryWriter(f"{args.log_path}{args.unique_name}/fold_{fold_idx}") if is_master(args) else None
+
+    optimizer = get_optimizer(args, net)
+    
+    if args.resume:
+        resume_load_optimizer_checkpoint(optimizer, args)
+        
+
+    #criterion = nn.CrossEntropyLoss(weight=torch.tensor(args.weight).cuda().float())
+    #criterion = nn.BCEWithLogitsLoss()
+    #criterion_dl = DiceLossMultiClass()
+
+    if args.multi_ch_tumor:
+        # load the class list with yaml file
+        with open(f'{args.data_root}/list/label_names.yaml', 'r') as f:
+            class_list = yaml.load(f, Loader=yaml.SafeLoader)
+            #sort
+            class_list = sorted(class_list)
+            grouped_classes=HA.group_classes(class_list)
+        matcher=HA.HungarianMatcher(grouped_classes)
+    else:
+        matcher=None
+    
+    #scaler = torch.cuda.amp.GradScaler() if args.amp else None
+    scaler = None
+    # no scaler for bf16 training. f16 is UNSTABLE, do not use it!
+    
+
+    ########################################################################################
+    # Start training
+    best_Dice = np.zeros(args.classes)
+    best_HD = np.ones(args.classes) * 1000
+    best_ASD = np.ones(args.classes) * 1000
+    
+    for epoch in range(args.start_epoch, args.epochs):
+        train_sampler.set_epoch(epoch)#this shuffles the dataset
+        if hasattr(trainLoader.dataset, 'shuffle_atlas'):
+            trainLoader.dataset.shuffle_atlas()
+
+        logging.info(f"Starting epoch {epoch+1}/{args.epochs}")
+        #exp_scheduler = exp_lr_scheduler_with_warmup(optimizer, init_lr=args.base_lr, epoch=epoch, warmup_epoch=args.warmup, max_epoch=args.epochs)
+        exp_scheduler = exp_lr_scheduler_with_warmup(optimizer, epoch=epoch, warmup_epoch=args.warmup, max_epoch=args.epochs)
+        logging.info(f"Current lr: {exp_scheduler:.4e}")
+       
+        train_epoch(trainLoader, net, ema_net, optimizer, epoch, writer, scaler, args,
+                    matcher=matcher, loss_wrapper=net.module.loss_wrapper,
+                    mtl_balancer=net.module.balancer)
+        
+        ##################################################################################
+        # Evaluation, save checkpoint and log training info
+        
+        
+        if is_master(args):
+            # save the latest checkpoint, including net, ema_net, and optimizer
+            net_state_dict, ema_net_state_dict = unwrap_model_checkpoint(net, ema_net, args)
+
+            save_checkpoint_atomic({
+                'epoch': epoch+1,
+                'model_state_dict': net_state_dict,
+                'ema_model_state_dict': ema_net_state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, f"{args.cp_path}{args.dataset}/{args.unique_name}/fold_{fold_idx}_latest.pth")
+
+            if (epoch+1) % 25 == 0:
+                # save the model
+                save_checkpoint_atomic({
+                    'epoch': epoch+1,
+                    'model_state_dict': net_state_dict,
+                    'ema_model_state_dict': ema_net_state_dict,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, f"{args.cp_path}{args.dataset}/{args.unique_name}/fold_{fold_idx}_epoch_{epoch+1}.pth")
+
+        #if False:
+        if False and (epoch) % args.val_freq == 0 and (not args.clip_pretrain):
+            net_for_eval = ema_net if args.ema else net
+
+            dice_list_test, ASD_list_test, HD_list_test = validation(net_for_eval, testLoader, args, matcher=matcher)
+            if is_master(args):
+                dice_list_test, ASD_list_test, HD_list_test = filter_validation_results(dice_list_test, ASD_list_test, HD_list_test, args) # filter results for some dataset, e.g. amos_mr
+                log_evaluation_result(writer, dice_list_test, ASD_list_test, HD_list_test, 'test', epoch, args)
+            
+                if dice_list_test.mean() >= best_Dice.mean():
+                    best_Dice = dice_list_test
+                    best_HD = HD_list_test
+                    best_ASD = ASD_list_test
+
+                    # Save the checkpoint with best performance
+                    net_state_dict, ema_net_state_dict = unwrap_model_checkpoint(net, ema_net, args)
+
+                    save_checkpoint_atomic({
+                        'epoch': epoch+1,
+                        'model_state_dict': net_state_dict,
+                        'ema_model_state_dict': ema_net_state_dict,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                    }, f"{args.cp_path}{args.dataset}/{args.unique_name}/fold_{fold_idx}_best.pth")
+
+                logging.info("Evaluation Done")
+                logging.info(f"Dice: {dice_list_test.mean():.4f}/Best Dice: {best_Dice.mean():.4f}")
+
+                writer.add_scalar('LR', exp_scheduler, epoch+1)
+
+        
+
+    return best_Dice, best_HD, best_ASD
+
+def to_fp32_tree(x):
+    if torch.is_tensor(x):
+        return x.float() if x.dtype in (torch.float16, torch.bfloat16) else x
+    if isinstance(x, dict):
+        return {k: to_fp32_tree(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        t = [to_fp32_tree(v) for v in x]
+        return type(x)(t)
+    return x
+
+def train_epoch(trainLoader, net, ema_net, optimizer, epoch, writer, scaler, args, matcher=None, loss_wrapper=None, mtl_balancer=None):
+    if mtl_balancer is not None and loss_wrapper is not None:
+        raise ValueError("You cannot use both mtl and loss_wrapper at the same time")
+    gc.collect()
+    elapsed_time_meter = AverageMeter("Elapsed Time", ":6.2f")
+    
+    net.train()
+    start_epoch_time = time.time()  # Track epoch start time
+    loss_meters = OrderedDict()
+    progress=None
+    iter_num_per_epoch = 0
+    for i, inputs in enumerate(trainLoader):
+        #print(net.module)
+        #layer = net.module.tumor_classifier.model.head.weight[0]
+        #layer = net.module.down1.conv_blocks[0].conv1.conv.weight[0,0,0]
+        #print('Weight:',net.module.tumor_classifier.model[1].head.weight[0])
+        
+        #if net.module.tumor_classifier.model.head.weight.grad is not None:
+         #   print('grad:',net.module.tumor_classifier.model[1].head.weight.grad[0])
+            
+        contrast=None
+        report_embeddings=None
+        crop_target = None
+        if 'ufo' in args.dataset:
+            img = inputs["image"]
+            #print(f'Input image shape: {img.shape}', flush=True, file=sys.stderr)
+            label = inputs["label"]
+            unk_voxels = inputs["unk_channels"].float()
+            tumor_volumes_in_crop = inputs["volumes"].float()
+            chosen_segment_mask = inputs["mask"].float()
+            tumor_diameters = inputs["diameters"].float()
+            if "weights" in inputs:
+                class_weights = inputs["weights"].float()
+            else:
+                class_weights = None
+            if 'attenuation' in inputs.keys():
+                tumor_attenuaton = inputs["attenuation"].float()
+            else:
+                tumor_attenuaton = None
+            if 'diameters_per_voxel' in inputs.keys():
+                tumor_volumes_in_crop_per_voxel = inputs['voumes_per_voxel']
+                tumor_diameters_per_voxel = inputs['diameters_per_voxel']
+            else:
+                tumor_volumes_in_crop_per_voxel = None
+                tumor_diameters_per_voxel = None
+            if args.clip_pretrain:
+                report_embeddings = inputs['clip_embedding'].float()
+                report_embeddings = report_embeddings.cuda(non_blocking=True)
+            if not args.model_genesis_pretrain:
+                label = label.long()
+            try:
+                names = inputs['name']
+            except KeyError:
+                names = None
+                
+            if "slices_cropped_dict" in inputs.keys() and args.slice_loss:
+                slices_cropped_dict = inputs["slices_cropped_dict"]
+            else:
+                slices_cropped_dict = None
+                
+            if "sizes_slices" in inputs.keys() and args.slice_loss:
+                sizes_slices = inputs["sizes_slices"]
+            else:
+                sizes_slices = None
+                
+            if "sizes_malignancy" in inputs.keys() and args.malignancy_classification:
+                sizes_malignancy = inputs["sizes_malignancy"]
+            else:
+                sizes_malignancy = None
+                
+            if "malignancy_per_voxel" in inputs.keys() and args.malignancy_classification:
+                malignancy_per_voxel = inputs["malignancy_per_voxel"]
+            else:
+                malignancy_per_voxel = None
+
+            # Pancreas-subtype tag from the per-tumor reports metadata (see
+            # dataset's get_pancreas_lesion_type). Used by the malignancy
+            # wrapper to supervise pdac/pnet/cyst channels on UFO cases.
+            if ("tumor_type" in inputs.keys()
+                    and hasattr(args, 'pancreas_malignancy_and_subtypes')
+                    and args.pancreas_malignancy_and_subtypes):
+                tumor_type = inputs["tumor_type"]               # list[str], len == B
+                tumor_type_organ = inputs["tumor_type_organ"]   # list[str], len == B
+            else:
+                tumor_type = None
+                tumor_type_organ = None
+
+            # Crop-target label per sample: 'pancreas_body' | 'pancreas' |
+            # 'random' | 'atlas_per_voxel' | ... . Surfaced in sanity dumps
+            # so the reader can tell subsegment / organ / random crops apart.
+            # See _normalize_crop_target in the dataset.
+            crop_target = inputs.get("crop_target", None)
+
+            if "contrast" in inputs.keys():
+                contrast = inputs["contrast"]
+            else:
+                contrast = None
+            if "age" in inputs.keys():
+                age = inputs["age"]
+            else:
+                age = None
+            if "sex" in inputs.keys():
+                sex = inputs["sex"]
+            else:
+                sex = None
+
+            
+            #print('Tumor volumes in crop returned:', tumor_volumes_in_crop, flush=True, file=sys.stderr)
+        elif 'jhh' in args.dataset and not args.epai_stage_2:
+            img, label, unk_voxels = inputs[0], inputs[1], inputs[2].float()
+            if not args.model_genesis_pretrain:
+                label = label.long()
+            tumor_diameters, tumor_volumes_in_crop, chosen_segment_mask, tumor_attenuaton = None, None, None, None
+            tumor_volumes_in_crop_per_voxel = None
+            tumor_diameters_per_voxel = None
+            names=None
+            tumor_type = None
+            tumor_type_organ = None
+        elif args.epai_stage_2:
+            img, label = inputs[0], inputs[1]
+            unk_voxels, tumor_volumes_in_crop, chosen_segment_mask, tumor_diameters, tumor_attenuaton = None, None, None, None, None
+            tumor_volumes_in_crop_per_voxel = None
+            tumor_diameters_per_voxel = None
+            names=None
+            tumor_type = None
+            tumor_type_organ = None
+        else:
+            img, label, class_weights = inputs[0], inputs[1], inputs[2].float()
+            if not args.model_genesis_pretrain:
+                label = label.long()
+            unk_voxels, tumor_volumes_in_crop, chosen_segment_mask, tumor_diameters, tumor_attenuaton = None, None, None, None, None
+            tumor_volumes_in_crop_per_voxel = None
+            tumor_diameters_per_voxel = None
+            names=None
+            slices_cropped_dict=None
+            sizes_slices = None
+            sizes_malignancy = None
+            malignancy_per_voxel = None
+            tumor_type = None
+            tumor_type_organ = None
+            age = None
+            sex =  None
+            contrast = None
+            
+        if args.epai_stage_2:
+            stage_1 = label[:,-1].float().unsqueeze(1)
+            #print('binary lesion label in train_ddp:', torch.unique(stage_1))
+            label = label[:,:-1].long()
+        else:
+            stage_1 = None
+            
+        if args.model_genesis_pretrain:
+            #moved to dataset
+            #print(f'Shape of img: {img.shape}')
+            #img, label = mg.generate_one_pair(img.cpu().numpy())
+            #print(f'Shape of img after model genesis: {img.shape}, label: {label.shape}')
+            #img=torch.from_numpy(img).cuda(non_blocking=True)
+            #label=torch.from_numpy(label).cuda(non_blocking=True)
+            #print('generated pair for model genesis')
+            assert img.shape == label.shape, 'Image and label must have the same shape, do you apply model genesis in your dataset?'
+            global counter_mg
+            if counter_mg<10:
+                counter_mg+=1
+                #save samples for debugging
+                os.makedirs('debug_model_genesis/',exist_ok=True)
+                lf.save_tensor_as_nifti(img[0,0],f'debug_model_genesis/{counter_mg}_x.nii.gz')
+                lf.save_tensor_as_nifti(label[0,0],f'debug_model_genesis/{counter_mg}_y.nii.gz')
+            #we sustitute the image and label by the pair generated by model genesis
+        
+        #print('Label max and shape:', label.max(), label.shape)
+        if args.aug_device != 'gpu':
+            img = img.cuda(non_blocking=True)
+            label = label.cuda(non_blocking=True)
+            if unk_voxels is not None:
+                unk_voxels = unk_voxels.cuda(non_blocking=True)
+            if tumor_volumes_in_crop is not None:
+                tumor_volumes_in_crop = tumor_volumes_in_crop.cuda(non_blocking=True)
+                if not args.use_all_data:
+                    assert (tumor_volumes_in_crop.sum(dim=-1)>=0).all(), 'There are samples without tumor volume in the batch, use --use_all_data to accept tumors of unknown size (marked as -999999 volume)'
+            if chosen_segment_mask is not None:
+                chosen_segment_mask = chosen_segment_mask.cuda(non_blocking=True)
+            if tumor_diameters is not None:
+                tumor_diameters = tumor_diameters.cuda(non_blocking=True)
+       
+        step = i + epoch * len(trainLoader) # global steps
+        
+        optimizer.zero_grad()
+        assert not torch.isnan(img).any(), 'Input is nan'
+        assert torch.max(img)<=100, f'Input is bigger than 100: {torch.max(img)}'
+        assert torch.min(img)>=-100, f'Input is smaller than -100: {torch.min(img)}'
+
+        #if contrast is None:
+        #    raise ValueError('No contrast loaded')
+
+        if args.amp:
+            if mtl_balancer is not None:
+                raise ValueError('MTL not implemented for AMP')
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):#do not use float16, unstable
+                result = net(img,stage_1_out = stage_1, labels = label, cut_attenuation_grad = (epoch < (args.warmup*4)),
+                             age=age,sex=sex) 
+
+            #cast to float32 
+            result = to_fp32_tree(result)
+            loss_all=lf.calculate_loss(model_output=result, label=label, unk_voxels=unk_voxels, args=args,
+                                matcher=matcher,chosen_segment_mask=chosen_segment_mask,tumor_volumes_report=tumor_volumes_in_crop, 
+                                tumor_diameters=tumor_diameters,
+                                classes=trainLoader.dataset.classes,loss_wrapper=net.module.loss_wrapper,input_tensor=img,
+                                class_weights=class_weights if 'class_weights' in locals() else None,
+                                model_genesis=args.model_genesis_pretrain,
+                                clip_only = args.clip_pretrain, report_embeddings=report_embeddings, dist=dist,
+                                tumor_attenuation_label=tumor_attenuaton,attenuation_classifier=args.attenuation_classifier,
+                                lesion_classes=trainLoader.dataset.lession_class_names if hasattr(trainLoader.dataset, 'lession_class_names') else None,
+                                tumor_volumes_in_crop_per_voxel=tumor_volumes_in_crop_per_voxel,
+                                tumor_diameters_per_voxel=tumor_diameters_per_voxel,
+                                names = names,
+                                slices_cropped_dict=slices_cropped_dict, sizes_slices=sizes_slices,
+                                dynamic_sample_weights=args.use_sample_weigths,
+                                no_mask=args.no_mask,
+                                sizes_malignancy=sizes_malignancy, malignancy_per_voxel=malignancy_per_voxel,
+                                tumor_type=tumor_type, tumor_type_organ=tumor_type_organ,
+                                crop_target=crop_target,
+                                contrast=contrast,
+                                subseg_dilation=args.organ_mask_dilation) # pass class_weights if available, otherwise None
+            loss=loss_all['overall']
+        else:
+            result = net(img,stage_1_out = stage_1, labels = label, cut_attenuation_grad = (epoch < (args.warmup*4)),
+                         age=age,sex=sex) 
+            loss_all=lf.calculate_loss(model_output=result, label=label, unk_voxels=unk_voxels, args=args,
+                                matcher=matcher,chosen_segment_mask=chosen_segment_mask,tumor_volumes_report=tumor_volumes_in_crop, 
+                                tumor_diameters=tumor_diameters,
+                                classes=trainLoader.dataset.classes,loss_wrapper=net.module.loss_wrapper,input_tensor=img,
+                                class_weights=class_weights if 'class_weights' in locals() else None,
+                                model_genesis=args.model_genesis_pretrain,
+                                clip_only = args.clip_pretrain, report_embeddings=report_embeddings, dist=dist,
+                                tumor_attenuation_label=tumor_attenuaton,attenuation_classifier=args.attenuation_classifier,
+                                lesion_classes=trainLoader.dataset.lession_class_names if hasattr(trainLoader.dataset, 'lession_class_names') else None,
+                                tumor_volumes_in_crop_per_voxel=tumor_volumes_in_crop_per_voxel,
+                                tumor_diameters_per_voxel=tumor_diameters_per_voxel,
+                                names = names, 
+                                slices_cropped_dict=slices_cropped_dict, sizes_slices = sizes_slices,
+                                dynamic_sample_weights=args.use_sample_weigths,
+                                no_mask=args.no_mask,
+                                sizes_malignancy=sizes_malignancy, malignancy_per_voxel=malignancy_per_voxel,
+                                tumor_type=tumor_type, tumor_type_organ=tumor_type_organ,
+                                crop_target=crop_target,
+                                contrast=contrast,
+                                subseg_dilation=args.organ_mask_dilation) # pass class_weights if available, otherwise None
+
+        if mtl_balancer is None:
+            loss=loss_all['overall']
+            loss.backward()
+            # If the sub-type wrapper stashed a sanity-dump state this
+            # batch, flush ∂loss/∂output NIfTIs + meta updates. Gated
+            # off inside the function when nothing was stashed.
+            from training import malignancy_subtype_wrapper as _msw
+            _msw.save_gradient_sanity_dumps()
+        else:
+            if args.classification_branch:
+                raise ValueError("We have not implemented MTL with classification branch yet, you must consider the cls branch is not a shared backbone")
+            _=loss_all.pop('overall')#remove the overall loss
+            mtl_balancer.step(
+                losses=loss_all,
+                shared_params=[param for name, param in net.named_parameters() if 'balancer' not in name],
+                task_specific_params=None
+            )
+        # Clip gradients before stepping the optimizer.
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        optimizer.step()
+            
+
+        if args.ema:
+            update_ema_variables(net, ema_net, args.ema_alpha, step)
+
+        if len(loss_meters) == 0:
+            loss_meters = {k: AverageMeter(k, ":6.4f") for k in loss_all.keys()}
+            loss_meters['Elapsed Time'] = AverageMeter("Elapsed Time", ":6.2f")
+
+        for k, v in loss_all.items():
+            loss_meters[k].update(v.item(), img.shape[0])
+
+        elapsed_time = time.time() - start_epoch_time
+
+        loss_meters['Elapsed Time'].update(elapsed_time, n=1)
+
+        if progress is None:
+            progress = ProgressMeter(
+                                    len(trainLoader) if args.dimension == '2d' else args.iter_per_epoch,
+                                    list(loss_meters.values()),
+                                    prefix=f"{args.unique_name} epoch: [{epoch + 1}]",
+                                )
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+        
+        if args.dimension == '3d':
+            iter_num_per_epoch += 1
+            if iter_num_per_epoch > args.iter_per_epoch:
+                break
+
+        #torch.cuda.empty_cache()
+
+    if is_master(args):
+        for key, meter in loss_meters.items():
+            writer.add_scalar(f"Train/{key}", meter.avg, epoch+1)
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(description='CBIM Meidcal Image Segmentation')
+    parser.add_argument('--optimizer', type=str, default='adamw', help='optimizer, adamw, adam, or sgd')
+    
+    parser.add_argument('--dataset', type=str, default='acdc', help='dataset name')
+    parser.add_argument('--model', type=str, default='unet', help='model name')
+    parser.add_argument('--dimension', type=str, default='2d', help='2d model or 3d model')
+    parser.add_argument('--pretrain', action='store_true', help='if use pretrained weight for init')
+    parser.add_argument('--amp', action='store_true', help='if use the automatic mixed precision for faster training')
+    parser.add_argument('--torch_compile', action='store_true', help='use torch.compile to accelerate training, only supported by pytorch2.0')
+    parser.add_argument('--training_size', type=int, default=None, help='the size of the training patch/crop')
+
+    parser.add_argument('--batch_size', default=32, type=int, help='batch size')
+    parser.add_argument('--resume', action='store_true', help='if resume training from checkpoint')
+    parser.add_argument('--load', type=str, default=False, help='load pretrained model')
+    parser.add_argument('--cp_path', type=str, default='./exp/', help='the path to save checkpoint and logging info')
+    parser.add_argument('--log_path', type=str, default='./log/', help='the path to save tensorboard log')
+    parser.add_argument('--unique_name', type=str, default='test', help='unique experiment name')
+    parser.add_argument('--use_k_fold', action='store_true', help='uses k fold cross validation')#just don't.... Use OOD evaluation instead.
+    parser.add_argument('--all_train', action='store_true', help='Uses all dataset in training')
+    parser.add_argument('--crop_on_tumor', action='store_true', help='Uses all dataset in training')#use this!
+    parser.add_argument('--multi_ch_tumor', action='store_true', help='Use when predicting tumor instances, uses Hungarian algorithm for matching predictions')
+    parser.add_argument('--multi_ch_tumor_data_root', type=str, default='/projects/bodymaps/Pedro/data/atlas_300_medformer_multi_ch_tumor_npy/', help='data root for multi channel tumor dataset')
+    parser.add_argument('--multi_ch_tumor_classes', type=int, default=61, help='number of classes for multi channel tumor dataset') 
+    parser.add_argument('--debug_val',  action='store_true', help='Runs validation before training')
+    parser.add_argument('--workers', type=int, default=None, help='overwrites number of workers in config file') 
+    parser.add_argument('--load_augmented',  action='store_true', help='Loads pre-saved crops for training. Should speed up things.')  
+    parser.add_argument('--save_destination', type=str, default=None, help='destination to save augmented data or to load it')  
+    parser.add_argument('--save_augmented', action='store_true', help='Saves after agumentation.')   
+    parser.add_argument('--learnable_loss_weights', action='store_true', help='Allows learnable loss weigths (https://arxiv.org/pdf/1705.07115).')  
+    parser.add_argument('--data_root', type=str, default=None, help='data root for dataset')
+    parser.add_argument('--UFO_root', type=str, default=None, help='data root for UFO dataset')
+    parser.add_argument('--jhh_root', type=str, default=None, help='data root for JHH dataset')
+    parser.add_argument('--ucsf_ids', type=str, default=None, help='location of a csv file with the UFO IDs to use for training')
+    parser.add_argument('--test_ids_exclude', type=str, default=None, help='location of a csv file with the test ids to exclude from training')
+    parser.add_argument('--atlas_ids', type=str, default=None, help='location of a csv file with the atlas training ids to include in training')
+
+    # NEW DDP arguments
+    parser.add_argument('--world_size', type=int, default=1, help='number of nodes for multi-node training')
+    parser.add_argument('--rank', type=int, default=0, help='node rank for multi-node training')
+    parser.add_argument('--dist_url', type=str, default='tcp://127.0.0.1:8001', help='url used to set up distributed training')
+    parser.add_argument('--dist_backend', type=str, default='nccl', help='distributed backend')
+    
+    #report_volume_loss_basic
+    parser.add_argument('--report_volume_loss_basic', type=float, default=1, help='weight for the volume loss basic')
+    parser.add_argument('--seg_loss', type=float, default=1, help='weight for the volume loss basic')
+    parser.add_argument('--pretrained', type=str, default=None, help='pretrained model path') 
+    parser.add_argument('--warmup', type=int, default=5, help='number of warmup epochs') 
+    parser.add_argument('--loss', type=str, default='l2_entropy', help='type of loss function to use in reports') 
+    parser.add_argument('--classification_branch', action='store_true', help='adds a classification branch to the model bottleneck')
+    parser.add_argument('--cls_gate', action='store_true', help='multiplies the segmentation sigmoid output by the classification sigmoid output--gate')
+    parser.add_argument('--cls_gate_norm', action='store_true', help='before applying the the cls gate, the segmentation output is normalized, making its maximum value above 0.5 become 1')
+    parser.add_argument('--cls_on_output', action='store_true', help='if true, the classification branch is on the output of the model, otherwise it is on the bottleneck')
+
+    #use the arguments below to load a pre-trained model and fine-tune it with a different class list. It uses output neuron keeping, which preserves weights for common classes across the old and new class lists.
+    parser.add_argument('--update_output_layer', action='store_true', help='update the output layer to have the same number of classes as the number of classes in the class_list')
+    parser.add_argument('--old_classes', type=str, default=None, help='old classes, we will keep weights/kernels of the old classes. This parameter should be a location of a yaml file with the old classes, we will sort them!')
+    
+    parser.add_argument('--epochs', type=int, default=None, help='number of epochs to train')
+    parser.add_argument('--classes_number', type=int, default=None, help='number of classes')
+    parser.add_argument('--ball_bce_weight', type=float, default=1, help='weight for the BCE loss of the ball loss')
+    parser.add_argument('--ball_dice_weight', type=float, default=1, help='weight for the Dice loss of the ball loss')
+    parser.add_argument('--stardard_ce_ball', action='store_true', help='use standard cross entropy averaging inside the ball loss. Otherwise, we take the average loss for forground and background pixels independently and sum them, giving more weight to avoiding FN.')
+    parser.add_argument('--lr', type=float, default=0.0006, help='learning rate')
+    parser.add_argument('--gpu', type=str, default='0,1,2,3')
+    parser.add_argument('--mtl', type=str, default=None, help='multi-task learning method. If None, no MTL. Uses method from https://github.com/SamsungLabs/MTL/')
+    parser.add_argument('--balanced_cropper', action='store_true', help='use the new balanced cropper')
+    parser.add_argument('--balance_pos_neg', action='store_true', help='balance healthy and disease cts')    
+    parser.add_argument('--class_weights', action='store_true', help='balance classes by their frequency in the dataset. This will use the inverse frequency of each class to weight the loss function.')
+    
+    parser.add_argument('--epai_stage_2', action='store_true', help='uses epai stage 2 training')
+    parser.add_argument('--stage_1_path', default=None, type=str, help='path to save folder of epai stage 1 results')
+    parser.add_argument('--aggregator_mode', type=str, default='concat', help='mode for the aggregator')
+    
+    parser.add_argument('--clip_pretrain', action='store_true', help='pretrains with the clip loss')
+    parser.add_argument('--clip_source', type=str, default='/projects/bodymaps/Pedro/data/report_embeddings_clinical_longformer/', help='pretrains with the clip loss')
+    
+    
+    parser.add_argument('--no_mask', action='store_true', help='uses no segmentation mask for training, only reports')
+    
+    #pretrain model genesis
+    parser.add_argument('--model_genesis_pretrain', action='store_true', help='skips ALL other losses, just uses model-genesis pre-training')
+
+    parser.add_argument('--pancreas_only', action='store_true', help='trains only on the pancreas')
+    parser.add_argument('--kidney_only', action='store_true', help='trains only on the kidney')
+    parser.add_argument('--UFO_only', action='store_true', help='trains only on the pancreas')
+    parser.add_argument('--Atlas_only', action='store_true', help='trains only on the kidney')
+    parser.add_argument('--no_pancreas_subseg', action='store_true', help='blances positives and negatives')
+    parser.add_argument('--ball_volume_margin', type=float, default=0.25, help='Margin of tolerance for tumor volume and diameter in the ball loss')
+    parser.add_argument('--volume_loss_tolerance', type=float, default=0.25, help='Margin of tolerance for tumor volume and diameter in the ball loss')
+    
+    #extra classifiers on top of the segmentation output
+    parser.add_argument('--attenuation_classifier', type=str, default='none')
+    parser.add_argument('--train_att_MLP_on_mask_only', action='store_true', help='if true, the attenuation classifier MLP is trained only on the mask (segmentation) output. Otherwise, it is trained on mask and model outputs.')
+    parser.add_argument('--att_weight', type=float, default=0.01, help='weight for the tumor attenuation loss')
+    parser.add_argument('--tumor_classifier', action='store_true', help='if true, adds a tumor classifier on top of the segmentation output. The classifier classifies tumor number and diameters.')
+    parser.add_argument('--cls_weight', type=float, default=0.01, help='weight for the tumor classifier loss')
+    parser.add_argument('--tumor_classes',nargs='+',default=None,help="List of tumor types to process")
+    parser.add_argument('--reports',default=None,help="Path to csv with reports")
+    parser.add_argument('--attenuation_classifier_venous', action='store_true', help='runs attenuation classifier only on venous phase')
+    
+
+    #using slices
+    parser.add_argument('--slice_loss', action='store_true', help='use the slice loss for training')
+    parser.add_argument('--train_on_slices_only', action='store_true', help='use the slice loss for training')
+    parser.add_argument('--sanity_path_debug', default='./DatasetSanityMultiTumorOnePerTumor/')
+    parser.add_argument('--use_all_data', action='store_true', help='uses all data, including reports w/o tumor size, for training')
+    parser.add_argument('--use_sample_weigths', action='store_true', help='uses weights to give more power to reports with more information (tumor slice, tumor size), using weights per sample. These weights are updated according to the number of each type of report (better reports usually are fewer).')
+    parser.add_argument('--balance_supervision_report_quality', action='store_true', help='balances the supervision according to report quality, so that reports with more tumor information are seen more often. Quality tiers: tumor size and slice, tumor size, no tumor size')
+    
+    parser.add_argument('--atlas_meta', type=str, default=None, help='path to atlas metadata (per voxel dataset)')
+    parser.add_argument('--exclude_ids', type=str, default=None, help='these ids will be excluded from the training set')
+    
+    parser.add_argument('--malignancy_classification', action='store_true', help='will train to differentiate between benign and malignant tumors, adds benign and malignant classes beyond the lesion classes')
+    parser.add_argument('--triangle_consistency', action='store_true', help='Uses an auxiliary loss to enforce triangle coherence: lesion = benign + malignant')
+    parser.add_argument('--benign_maligant_only', action='store_true', help='loads only data confirmed as benign or malignant, excluding uncertain cases')
+    parser.add_argument('--malignant_col', type=str, default='pathology_and_radiology_malignant', help='for a less strict malignancy definition, set as malignancy (radiology based)')
+    parser.add_argument('--benign_col', type=str, default='radiology_benign_ICD_pathology_ok', help='column indicating benign cases')
+    parser.add_argument('--load_malignancy', action='store_true', help='loads information about malignancy of lesions')
+    parser.add_argument('--include_ball_loss_malignancy', action='store_true', help='includes the ball loss label refinement for the malignancy classification, instead of just using distillation')
+    parser.add_argument('--upsample_malig_benign', action='store_true', help='upsamples malignant and benign cases to half of dataset; incompatible with --benign_maligant_only')
+    parser.add_argument('--relaxed_malignancy_col', default=None, help='set to malignancy if you want to use radiology-based malignancy in cases without pathology, instead of strict pathology-based malignancy only. PS: radiology-based malignancy do not get prioritized in data loading anyway (see clean_ufo)')
+    
+    
+    
+    parser.add_argument('--WD', type=float, default=None, help='weight decay, defaults to 0.05, like MedFormer')
+    parser.add_argument('--cls_on_segmentation', action='store_true', help='if true, the classification branch is on the segmentation output')
+    parser.add_argument('--binarize_cls_on_segmentation', action='store_true', help='if true, the classification branch on the segmentation output receives binary inputs (straight through trick)')
+
+    parser.add_argument('--organ_mask_dilation', type=int, default=51, help='dilation to compensate for organ mask inaccuracies')
+    parser.add_argument('--age_and_sex_into_classifier', action='store_true', help='provides patient age and sex to the classifier on top of the segmenter')
+    
+    parser.add_argument('--mask_train_proportion', type=float, default=50, help='Use probabilities (0-100); proportion of training samples to use with the segmentation mask.')
+    parser.add_argument('--pancreas_malignancy_and_subtypes', action='store_true', help='if true, the model will classify not only malignancy but also subtypes of pancreatic tumors')
+    
+    #allow_partial_load
+    parser.add_argument('--allow_partial_load', action='store_true', help='allows loading a pretraining checkpoint to be loaded even when some weight shapes do not match. Be careful.')
+    
+    
+    
+    parser.add_argument('--ablation_no_organ_mask', action='store_true', help='Ablation that removes organ masks from the ball loss and volume loss, dropping performance. Be careful.')
+    
+
+
+    args = parser.parse_args()
+    
+    if args.mask_train_proportion <= 1:
+        raise ValueError('mask_train_proportion should be between 1 and 100, representing the percentage of training samples to use with the segmentation mask. If you want to train without masks, use --no_mask instead.')
+    
+    atlas_meta=args.atlas_meta
+    reports = args.reports
+    dr = args.data_root
+    epochs = args.epochs
+    ufo_root = args.UFO_root
+    jhh_root = args.jhh_root
+    w = args.workers
+    lr = args.lr
+    WD = args.WD
+    classes_number = args.classes_number
+    training_size = args.training_size
+    
+    args.clip_loss = False
+    args.load_clip = False
+
+    config_path = 'config/%s/%s_%s.yaml'%(args.dataset, args.model, args.dimension)
+    if not os.path.exists(config_path):
+        raise ValueError("The specified configuration doesn't exist: %s"%config_path)
+
+    print('Loading configurations from %s'%config_path)
+
+    with open(config_path, 'r') as f:
+        config = yaml.load(f, Loader=yaml.SafeLoader)
+
+    for key, value in config.items():
+        if not hasattr(args, key):
+            setattr(args, key, value)
+
+    if args.multi_ch_tumor:
+        #overwrites the arguments in config file
+        args.classes = args.multi_ch_tumor_classes
+        args.data_root = args.multi_ch_tumor_data_root
+        print('Using multi channel tumor dataset')
+        print(f'Using multi channel tumor, overwriting classes to {args.classes}')
+        print(f'Using multi channel tumor, overwriting data root to {args.data_root}')
+
+    if w is not None:
+        args.num_workers = w
+        print(f'Overwriting number of workers to {w}')
+    if dr is not None:
+        args.data_root = dr
+    if epochs is not None:
+        args.epochs = epochs
+    if ufo_root is not None:
+        args.UFO_root = ufo_root
+    if jhh_root is not None:
+        args.jhh_root = jhh_root
+    if classes_number is not None:
+        args.classes = classes_number
+    if lr is not None:
+        args.base_lr = lr
+        print(f'Overwriting learning rate to {lr}')
+    if atlas_meta is not None:
+        args.atlas_meta = atlas_meta
+        print(f'Overwriting atlas meta to {atlas_meta}')
+    if WD is not None:
+        args.weight_decay = WD
+        print(f'Overwriting weight_decay to {WD}')
+        
+    if training_size is not None:
+        args.training_size = [training_size, training_size, training_size]
+        print(f'Overwriting training size to {training_size}')
+    else:
+        args.training_size = [128,128,128]
+            
+    if reports is not None:
+        args.reports = reports
+
+
+    if args.epai_stage_2:
+        args.update_output_layer = True
+        args.classes_number = 4
+        args.classification_branch = True
+        args.cls_on_output = True
+        
+    if args.model_genesis_pretrain:
+        #disable deep supervision
+        args.aux_loss = False
+        args.classes = 1
+        args.classes_number = 1
+        
+    if args.clip_pretrain:
+        #disable deep supervision
+        args.clip_loss = True
+        args.load_clip = True
+        
+    args.batch_size_global = args.batch_size
+        
+    return args
+    
+def compare(net, checkpoint, max_print=200):
+    # 1) get checkpoint state_dict
+    sd = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
+    if not isinstance(sd, dict):
+        raise ValueError("Checkpoint doesn't look like a state_dict or contain one under 'state_dict'/'model'.")
+
+    # 2) normalize keys: strip "module." if present
+    def strip_module(d):
+        if any(k.startswith("module.") for k in d.keys()):
+            return {k[len("module."):]: v for k, v in d.items()}
+        return d
+
+    net_sd = strip_module(net.state_dict())
+    ckpt_sd = strip_module(sd)
+
+    # 3) key diffs
+    net_keys = set(net_sd.keys())
+    ckpt_keys = set(ckpt_sd.keys())
+
+    missing = sorted(net_keys - ckpt_keys)
+    extra   = sorted(ckpt_keys - net_keys)
+
+    # 4) value/shape diffs on common keys
+    mismatched = []
+    for k in sorted(net_keys & ckpt_keys):
+        a = net_sd[k].detach().cpu()
+        b = ckpt_sd[k].detach().cpu()
+
+        if a.shape != b.shape:
+            mismatched.append((k, "shape", tuple(a.shape), tuple(b.shape), None))
+            continue
+
+        # compare in float32 (works fine for fp16/bf16 too)
+        diff = (a.float() - b.float()).abs()
+        max_abs = diff.max().item() if diff.numel() else 0.0
+        if max_abs != 0.0:
+            mismatched.append((k, "value", tuple(a.shape), tuple(b.shape), max_abs))
+
+    print(f"Missing in ckpt: {len(missing)} | Extra in ckpt: {len(extra)} | Mismatched: {len(mismatched)}")
+
+    if missing:
+        print("\n-- missing (net has, ckpt doesn't) --")
+        for k in missing[:max_print]:
+            print(k)
+
+    if extra:
+        print("\n-- extra (ckpt has, net doesn't) --")
+        for k in extra[:max_print]:
+            print(k)
+
+    if mismatched:
+        print("\n-- mismatched --")
+        for k, kind, sh_a, sh_b, max_abs in mismatched[:max_print]:
+            if kind == "shape":
+                print(f"{k}: SHAPE net={sh_a} ckpt={sh_b}")
+            else:
+                print(f"{k}: VALUE shape={sh_a} max|diff|={max_abs:.6g}")
+                
+    if mismatched+missing+extra == 0:
+        print("All parameters match!")
+    else:
+        raise ValueError(f'Parameter mismatch found: {len(missing)} missing, {len(extra)} extra, {len(mismatched)} mismatched.'+strg)
+
+    return {"missing": missing, "extra": extra, "mismatched": mismatched}
+
+def init_network(args,classes=None,old_classes=None):
+    if args.model_genesis_pretrain:
+        c = old_classes
+        classes = ['model_genesis']
+        print('set classes as model_genesis')
+    elif args.update_output_layer and ('epai_stage_2' not in args.pretrained or args.pretrained is None):
+        c = old_classes # we must load the checkpoint with the old classes
+    else:
+        c = classes
+        
+    c = sorted(c) #added sort since we sort in loss function. notice that malignancy classes will be added after sorting
+        
+        
+    print('Old classes:', old_classes)
+    
+    net = get_model(args, pretrain=args.pretrain,classes=c)
+    
+
+    if args.ema:
+        ema_net = get_model(args, pretrain=args.pretrain,classes=c)
+        logging.info("Use EMA model for evaluation")
+    else:
+        ema_net = None
+        
+    if args.update_output_layer or args.malignancy_classification:
+        from model.dim3.medformer import update_output_layer_onk
+        print('Classes for onk:', classes)
+        if args.malignancy_classification and old_classes is None:
+            old_classes = classes
+        if args.malignancy_classification:
+            lesion_classes = [c for c in sorted(classes) if 'lesion' in c]
+            malignants = [c.replace('lesion', 'malignant') for c in lesion_classes]
+            benigns = [c.replace('lesion', 'benign') for c in lesion_classes]
+            new_classes = classes + malignants + benigns
+        else:
+            new_classes = classes
+        
+        net=update_output_layer_onk(net, original_classes=old_classes, new_classes=new_classes, copy_pancreas=args.no_mask,
+                                    binarize_cls_on_segmentation=args.binarize_cls_on_segmentation,
+                                    age_and_sex=args.age_and_sex_into_classifier)
+
+        #also update the ema net
+        ema_net=update_output_layer_onk(ema_net, original_classes=old_classes, new_classes=new_classes, copy_pancreas=args.no_mask,
+                                    binarize_cls_on_segmentation=args.binarize_cls_on_segmentation,
+                                    age_and_sex=args.age_and_sex_into_classifier)
+        
+        if args.pretrained:
+            try:
+                net.load_state_dict(torch.load(args.pretrained)['model_state_dict'], strict=False)  
+                print(f'Successfully loaded pretrained pre-trained model: {args.pretrained}, input shape is {args.training_size}')
+            except:
+                print(f'Your pretrained model has some parameter shape mismatch with the current model, maybe because of the output layer update. It was partially loaded though (in get_model, except for mismatched blocks).')
+                #net.load_state_dict(torch.load(args.pretrained)['model_state_dict'], strict=False)
+                net,_,_ = load_state_dict_best_effort(net,torch.load(args.pretrained)['model_state_dict'],verbose=True)
+                
+    if args.epai_stage_2:
+        if net.inc.conv1.weight.shape[1] == 1:
+            net.set_aggregator()
+            #start aggregator on initial layer
+            ema_net.set_aggregator()
+    
+    if args.resume:
+        resume_load_model_checkpoint(net, ema_net, args)
+
+    if args.torch_compile:
+        net = torch.compile(net)
+
+    #print(net)
+    #debug wether all  parameters are correctly loaded
+    #checkpoint = torch.load(args.pretrained)['model_state_dict']
+    #compare(net, checkpoint)
+    #raise ValueError('Stop for debugging')
+
+    return net, ema_net 
+
+
+
+
+from typing import Mapping, Tuple, Dict
+def load_state_dict_best_effort(
+    new_module: nn.Module,
+    old_state_dict: Mapping[str, torch.Tensor],
+    *,
+    verbose: bool = False,
+    tag: str = "load_state_dict_with_overlap",
+) -> Tuple[nn.Module, Dict[str, int], Tuple[list[str], list[str]]]:
+    """
+    Transfer weights/buffers from old_state_dict into new_module as much as possible.
+
+    Rules:
+      (1) exact match: same key + same shape
+      (2) 5D/4D conv weights: if spatial/kernel dims match, copy overlap in [O,I]
+      (3) 2D weights (Linear/projections): copy overlap in [O,I]
+      (4) 1D tensors: copy overlap in length
+      else: skip
+
+    Returns:
+      (new_module, stats, (missing_keys, unexpected_keys))
+    """
+    new_sd = new_module.state_dict()
+    load_sd: Dict[str, torch.Tensor] = {}
+
+    copied_exact = 0
+    copied_partial = 0
+    skipped = 0
+
+    for k, v_new in new_sd.items():
+        v_old = old_state_dict.get(k, None)
+        if v_old is None:
+            skipped += 1
+            continue
+
+        # (1) exact
+        if v_old.shape == v_new.shape:
+            load_sd[k] = v_old
+            copied_exact += 1
+            continue
+
+        # (2) conv-like (4D/5D): match kernel dims, overlap O/I channels
+        if v_old.ndim in (4, 5) and v_new.ndim == v_old.ndim:
+            if v_old.shape[2:] == v_new.shape[2:]:
+                tmp = v_new.clone()
+                o = min(v_old.shape[0], v_new.shape[0])
+                i = min(v_old.shape[1], v_new.shape[1])
+                tmp[:o, :i, ...] = v_old[:o, :i, ...]
+                load_sd[k] = tmp
+                copied_partial += 1
+                continue
+
+        # (3) 2D weights (Linear / attention projections / MLP)
+        if v_old.ndim == 2 and v_new.ndim == 2:
+            tmp = v_new.clone()
+            o = min(v_old.shape[0], v_new.shape[0])
+            i = min(v_old.shape[1], v_new.shape[1])
+            tmp[:o, :i] = v_old[:o, :i]
+            load_sd[k] = tmp
+            copied_partial += 1
+            continue
+
+        # (4) 1D tensors: bias, norm weight/bias, running stats, etc.
+        if v_old.ndim == 1 and v_new.ndim == 1:
+            tmp = v_new.clone()
+            n = min(v_old.shape[0], v_new.shape[0])
+            tmp[:n] = v_old[:n]
+            load_sd[k] = tmp
+            copied_partial += 1
+            continue
+
+        skipped += 1
+
+    missing, unexpected = new_module.load_state_dict(load_sd, strict=False)
+
+    stats = {
+        "copied_exact": copied_exact,
+        "copied_partial": copied_partial,
+        "skipped": skipped,
+        "missing_after_load": len(missing),
+        "unexpected_after_load": len(unexpected),
+    }
+
+    if verbose:
+        print(f"[{tag}] {stats}", flush=True)
+
+    return new_module, stats, (missing, unexpected)
+
+
+def main_worker(proc_idx, ngpus_per_node, fold_idx, args, result_dict=None, trainset=None, testset=None):
+    # seed each process
+    if args.reproduce_seed is not None:
+        random.seed(args.reproduce_seed)
+        np.random.seed(args.reproduce_seed)
+        torch.manual_seed(args.reproduce_seed)
+
+        if hasattr(torch, "set_deterministic"):
+            torch.set_deterministic(True)
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+    # set process specific info
+    args.proc_idx = proc_idx
+    args.ngpus_per_node = ngpus_per_node
+
+    # suppress printing if not master
+    if args.multiprocessing_distributed and args.proc_idx != 0:
+        def print_pass(*args, **kwargs):
+            pass
+
+        #builtins.print = print_pass
+    if args.distributed:
+        if args.dist_url == "env://" and args.rank == -1:
+            args.rank = int(os.environ["RANK"])
+        if args.multiprocessing_distributed:
+            # For multiprocessing distributed training, rank needs to be the
+            # global rank among all the processes
+            args.rank = args.rank * ngpus_per_node + proc_idx
+        
+        dist.init_process_group(
+            backend=args.dist_backend,
+            init_method=f"{args.dist_url}",
+            world_size=args.world_size,
+            rank=args.rank,
+        )
+        torch.cuda.set_device(args.proc_idx)
+
+        # adjust data settings according to multi-processing
+        args.batch_size = int(args.batch_size / args.ngpus_per_node)
+        args.workers = int((args.num_workers + args.ngpus_per_node - 1) / args.ngpus_per_node)
+
+
+    args.cp_dir = f"{args.cp_path}/{args.dataset}/{args.unique_name}"
+    os.makedirs(args.cp_dir, exist_ok=True)
+    configure_logger(args.rank, args.cp_dir+f"/fold_{fold_idx}.txt")
+    save_configure(args)
+
+    logging.info(
+        f"\nDataset: {args.dataset},\n"
+        + f"Model: {args.model},\n"
+        + f"Dimension: {args.dimension}"
+    )
+    
+    if args.old_classes is not None:
+        with open(args.old_classes, 'r') as f:
+            old_classes = yaml.load(f, Loader=yaml.SafeLoader)
+            #sort--we sorted when saving in nii2npy.py
+        args.old_classes = sorted(old_classes)
+        old_classes=args.old_classes
+    else:
+        if args.epai_stage_2:
+            raise ValueError('You must provide the old classes for epai stage 2')
+        old_classes = None
+    net, ema_net = init_network(args,classes=trainset.classes,old_classes=old_classes)
+      
+    
+    net.to('cuda')
+    if args.ema:
+        ema_net.to('cuda')
+    if args.distributed:
+        net = nn.SyncBatchNorm.convert_sync_batchnorm(net)
+        net = DistributedDataParallel(net, device_ids=[args.proc_idx], find_unused_parameters=False)
+        # set find_unused_parameters to True if some of the parameters is not used in forward
+        
+        if args.ema:
+            ema_net = nn.SyncBatchNorm.convert_sync_batchnorm(ema_net)
+            ema_net = DistributedDataParallel(ema_net, device_ids=[args.proc_idx], find_unused_parameters=False)
+            
+            for p in ema_net.parameters():
+                p.requires_grad_(False)
+
+
+    logging.info(f"Created Model")
+    best_Dice, best_HD, best_ASD = train_net(net, trainset, testset, args, ema_net, fold_idx=fold_idx)
+    
+    logging.info(f"Training and evaluation on Fold {fold_idx} is done")
+    
+    if args.distributed:
+        if is_master(args):
+            # collect results from the master process
+            result_dict['best_Dice'] = best_Dice
+            result_dict['best_HD'] = best_HD
+            result_dict['best_ASD'] = best_ASD
+    else:
+        return best_Dice, best_HD, best_ASD
+        
+
+        
+
+
+
+if __name__ == '__main__':
+    # parse the arguments
+    args = get_parser()
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    torch.multiprocessing.set_start_method('spawn')
+    args.log_path = args.log_path + '%s/'%args.dataset
+
+    if args.dist_url == "env://" and args.world_size == -1:
+        args.world_size = int(os.environ["WORLD_SIZE"])
+
+    args.distributed = args.world_size > 1 or args.multiprocessing_distributed
+
+
+    ngpus_per_node = torch.cuda.device_count()
+    
+    
+    Dice_list, HD_list, ASD_list = [], [], []
+    if args.use_k_fold:
+        the_folds=range(args.k_fold)
+    else:
+        the_folds=[0]
+    for fold_idx in the_folds:
+        if args.multiprocessing_distributed:
+            with mp.Manager() as manager:
+            # use the Manager to gather results from the processes
+                result_dict = manager.dict()
+                    
+                # Since we have ngpus_per_node processes per node, the total world_size
+                # needs to be adjusted accordingly
+                args.world_size = ngpus_per_node * args.world_size
+                trainset = get_dataset(args, mode='train', fold_idx=fold_idx, all_train=args.all_train, crop_on_tumor=args.crop_on_tumor,
+                           load_augmented=args.load_augmented, save_destination=args.save_destination,
+                           save_augmented=args.save_augmented) 
+                #x = trainset.__getitem__(0,BDMAP_ID='BDMAP_00055037')
+                #raise ValueError(f'Debug: loaded item from trainset: \n volumes: \n {x["volumes"]}\n Diameters:\n {x["diameters"]}\n Attenuation:\n {x["attenuation"]}')
+                testset = get_dataset(args, mode='test', fold_idx=fold_idx)
+                # Use torch.multiprocessing.spawn to launch distributed processes:
+                # the main_worker process function
+                mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, fold_idx, args, result_dict, trainset, testset))
+                best_Dice = result_dict['best_Dice']
+                best_HD = result_dict['best_HD']
+                best_ASD = result_dict['best_ASD']
+            args.world_size = 1
+        else:
+            trainset = get_dataset(args, mode='train', fold_idx=fold_idx, all_train=args.all_train, crop_on_tumor=args.crop_on_tumor,
+                           load_augmented=args.load_augmented, save_destination=args.save_destination)  
+            
+            #x = trainset.__getitem__(0,BDMAP_ID='BDMAP_00055037')
+            #raise ValueError(f'Debug: loaded item from trainset: \n volumes: \n {x["volumes"]}\n Diameters:\n {x["diameters"]}\n Attenuation:\n {x["attenuation"]}')
+            testset = get_dataset(args, mode='test', fold_idx=fold_idx)
+            # Simply call main_worker function
+            best_Dice, best_HD, best_ASD = main_worker(0, ngpus_per_node, fold_idx, args, trainset=trainset, testset=testset)
+
+
+
+        Dice_list.append(best_Dice)
+        HD_list.append(best_HD)
+        ASD_list.append(best_ASD)
+    
+    #############################################################################################
+    # Save the cross validation results
+    total_Dice = np.vstack(Dice_list)
+    total_HD = np.vstack(HD_list)
+    total_ASD = np.vstack(ASD_list)
+    
+
+    with open(f"{args.cp_path}/{args.dataset}/{args.unique_name}/cross_validation.txt",  'w') as f:
+        np.set_printoptions(precision=4, suppress=True) 
+        f.write('Dice\n')
+        for i in range(args.k_fold):
+            f.write(f"Fold {i}: {Dice_list[i]}\n")
+        f.write(f"Each Class Dice Avg: {np.mean(total_Dice, axis=0)}\n")
+        f.write(f"Each Class Dice Std: {np.std(total_Dice, axis=0)}\n")
+        f.write(f"All classes Dice Avg: {total_Dice.mean()}\n")
+        f.write(f"All classes Dice Std: {np.mean(total_Dice, axis=1).std()}\n")
+
+        f.write("\n")
+
+        f.write("HD\n")
+        for i in range(args.k_fold):
+            f.write(f"Fold {i}: {HD_list[i]}\n")
+        f.write(f"Each Class HD Avg: {np.mean(total_HD, axis=0)}\n")
+        f.write(f"Each Class HD Std: {np.std(total_HD, axis=0)}\n")
+        f.write(f"All classes HD Avg: {total_HD.mean()}\n")
+        f.write(f"All classes HD Std: {np.mean(total_HD, axis=1).std()}\n")
+
+        f.write("\n")
+
+        f.write("ASD\n")
+        for i in range(args.k_fold):
+            f.write(f"Fold {i}: {ASD_list[i]}\n")
+        f.write(f"Each Class ASD Avg: {np.mean(total_ASD, axis=0)}\n")
+        f.write(f"Each Class ASD Std: {np.std(total_ASD, axis=0)}\n")
+        f.write(f"All classes ASD Avg: {total_ASD.mean()}\n")
+        f.write(f"All classes ASD Std: {np.mean(total_ASD, axis=1).std()}\n")
+
+
+
+        
+    print(f'All {args.k_fold} folds done.')
+
+    sys.exit(0)
+
+

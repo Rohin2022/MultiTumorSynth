@@ -1,0 +1,163 @@
+optimizer: adamw
+dataset: abdomenatlas
+model: medformer
+dimension: 3d
+pretrain: False
+amp: False
+torch_compile: False
+training_size: [128, 128, 128]
+batch_size: 2
+resume: False
+load: False
+cp_path: ./exp/
+log_path: ./log/abdomenatlas/
+unique_name: mask_only_model_name
+use_k_fold: False
+all_train: False
+crop_on_tumor: True
+multi_ch_tumor: False
+multi_ch_tumor_data_root: /projects/bodymaps/Pedro/data/atlas_300_medformer_multi_ch_tumor_npy/
+multi_ch_tumor_classes: 61
+debug_val: False
+workers: 4
+load_augmented: True
+save_destination: /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugDirV1
+save_augmented: False
+learnable_loss_weights: False
+data_root: /scratch/rpinise1/MultiTumorSynthesis/Synthetic_NPZ_V1
+UFO_root: None
+jhh_root: None
+ucsf_ids: None
+test_ids_exclude: None
+atlas_ids: None
+world_size: 1
+rank: 0
+dist_url: tcp://127.0.0.1:8001
+dist_backend: nccl
+report_volume_loss_basic: 0.0
+seg_loss: 1
+pretrained: None
+warmup: 5
+loss: l2_entropy
+classification_branch: False
+cls_gate: False
+cls_gate_norm: False
+cls_on_output: False
+update_output_layer: False
+old_classes: None
+epochs: 100
+classes_number: None
+ball_bce_weight: 1
+ball_dice_weight: 1
+stardard_ce_ball: False
+lr: 0.0001
+gpu: 0
+mtl: None
+balanced_cropper: False
+balance_pos_neg: False
+class_weights: False
+epai_stage_2: False
+stage_1_path: None
+aggregator_mode: concat
+clip_pretrain: False
+clip_source: /projects/bodymaps/Pedro/data/report_embeddings_clinical_longformer/
+no_mask: False
+model_genesis_pretrain: False
+pancreas_only: False
+kidney_only: False
+UFO_only: False
+Atlas_only: False
+no_pancreas_subseg: False
+ball_volume_margin: 0.25
+volume_loss_tolerance: 0.25
+attenuation_classifier: none
+train_att_MLP_on_mask_only: False
+att_weight: 0.01
+tumor_classifier: False
+cls_weight: 0.01
+tumor_classes: None
+reports: None
+attenuation_classifier_venous: False
+slice_loss: False
+train_on_slices_only: False
+sanity_path_debug: ./DatasetSanityMultiTumorOnePerTumor/
+use_all_data: False
+use_sample_weigths: False
+balance_supervision_report_quality: False
+atlas_meta: None
+exclude_ids: None
+malignancy_classification: False
+triangle_consistency: False
+benign_maligant_only: False
+malignant_col: pathology_and_radiology_malignant
+benign_col: radiology_benign_ICD_pathology_ok
+load_malignancy: False
+include_ball_loss_malignancy: False
+upsample_malig_benign: False
+relaxed_malignancy_col: None
+WD: None
+cls_on_segmentation: False
+binarize_cls_on_segmentation: False
+organ_mask_dilation: 51
+age_and_sex_into_classifier: False
+mask_train_proportion: 50
+pancreas_malignancy_and_subtypes: False
+allow_partial_load: False
+ablation_no_organ_mask: False
+clip_loss: False
+load_clip: False
+classes: 42
+modality: CT
+arch: medformer
+in_chan: 1
+base_chan: 32
+conv_block: BasicBlock
+down_scale: [[2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2]]
+kernel_size: [[3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3]]
+chan_num: [64, 128, 256, 320, 256, 128, 64, 32]
+norm: in
+act: relu
+map_size: [3, 3, 3]
+conv_num: [2, 0, 0, 0, 0, 0, 2, 2]
+trans_num: [0, 2, 4, 6, 4, 2, 0, 0]
+num_heads: [1, 4, 8, 10, 8, 4, 1, 1]
+expansion: 4
+fusion_depth: 2
+fusion_dim: 320
+fusion_heads: 10
+attn_drop: 0
+proj_drop: 0
+proj_type: depthwise
+start_epoch: 0
+num_workers: 4
+aug_device: cpu
+aux_loss: True
+aux_weight: [0.5, 0.5]
+split_seed: 0
+k_fold: 10
+base_lr: 0.0001
+betas: [0.9, 0.999]
+weight_decay: 0.05
+weight: [0.5, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+rlt: 1
+scale: [0, 0, 0]
+rotate: [30, 30, 30]
+translate: [0, 0, 0]
+affine_pad_size: [40, 40, 40]
+gaussian_noise_std: 0.02
+print_freq: 5
+iter_per_epoch: 1000
+ema: True
+ema_alpha: 0.99
+val_freq: 5
+sliding_window: True
+window_size: [128, 128, 128]
+proc_idx: 0
+port: 10000
+multiprocessing_distributed: True
+reproduce_seed: 42
+inference_2_stages: False
+batch_size_global: 2
+distributed: True
+ngpus_per_node: 1
+cp_dir: ./exp//abdomenatlas/mask_only_model_name
