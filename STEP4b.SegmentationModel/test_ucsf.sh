@@ -18,8 +18,8 @@ models=(
     #"./exp/abdomenatlas_ufo_multi_tumor/Dataset_133K_merlin_ucsf_attenuation_slice_loss_all_data_lr4_RSuperMTL_cls_on_segmentation_att_classifier_venous_only_no_mask_ft_slices_only/fold_0_latest.pth"
     #"./exp/abdomenatlas_ufo_multi_tumor/Dataset_133K_merlin_ucsf_attenuation_slice_loss_all_data_lr4_RSuperMTL_cls_on_segmentation_att_classifier_venous_only/fold_0_latest.pth"
     
-    "exp/abdomenatlas/mask_only_model_name/fold_0_latest.pth"
-    #"./exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth"
+    #"exp/abdomenatlas/mask_only_model_name/fold_0_latest.pth"
+    "/projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth"
 
     #"./exp/abdomenatlas/clip_ft_UCSF133K/fold_0_latest.pth"
     #"./exp/abdomenatlas_ufo_multi_tumor/Dataset_133K_merlin_ucsf_attenuation_slice_loss_all_data_lr4_RSuperMTL_cls_on_segmentation_att_classifier_venous_only_no_mask/fold_0_latest.pth"
@@ -69,9 +69,9 @@ run_model() {
     while [[ "${attempt}" -le "${max_retries}" ]]; do
         python predict_abdomenatlas.py --load "${model}" \
             --img_path "${test_set}" \
-            --class_list /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/preprocessing/label_names.yaml \
+            --class_list /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml \
             --gpu ${gpu} --organ_mask_on_lesion ${extra_flag} \
-            --save_path ./result/finetuned_model_turkish/ \
+            --save_path ./result/baseline_model_turkish/ \
             --parts ${total_parts} --current_part ${current_part} \
             --ids /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/cross_eval/testing_ids_turkish.csv \
             --meta /projects/bodymaps/Data/metadata_ucsf_batch_1_to_6_and_merlin.csv \

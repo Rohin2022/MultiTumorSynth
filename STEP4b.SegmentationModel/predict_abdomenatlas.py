@@ -491,7 +491,8 @@ def postprocess(pred, reoriented_itk_img, original_idx, origin_orientation, targ
             elif organ_name == 'uterus':
                 organ = pred_dict['prostate']
             elif organ_name == 'gallbladder':
-                organ = pred_dict['gallbladder']
+                key = 'gallbladder' if 'gallbladder' in pred_dict else 'gall_bladder'
+                organ = pred_dict[key]
             elif organ_name in ['bone','breast']:
                 #we do not have organ masks for these, make a mask of ones
                 size = pred_dict['prostate'].GetSize()
@@ -514,7 +515,8 @@ def postprocess(pred, reoriented_itk_img, original_idx, origin_orientation, targ
             elif organ_name == 'uterus':
                 organ.CopyInformation(pred_dict['prostate'])
             elif organ_name == 'gallbladder':
-                organ.CopyInformation(pred_dict['gallbladder'])
+                key = 'gallbladder' if 'gallbladder' in pred_dict else 'gall_bladder'
+                organ.CopyInformation(pred_dict[key])
             elif organ_name in ['bone','breast']:
                 #we do not have organ masks for these, make a mask of ones
                 organ.CopyInformation(pred_dict['prostate'])
@@ -712,7 +714,8 @@ def postprocess_npz(pred, classes, args):
             elif organ_name == 'uterus':
                 organ = pred_dict['prostate']
             elif organ_name == 'gallbladder':
-                organ = pred_dict['gallbladder']
+                key = 'gallbladder' if 'gallbladder' in pred_dict else 'gall_bladder'
+                organ = pred_dict[key]
             elif organ_name in ['bone','breast']:
                 #we do not have organ masks for these, make a mask of ones
                 organ = np.ones_like(pred_dict['prostate'], dtype=np.uint8)
