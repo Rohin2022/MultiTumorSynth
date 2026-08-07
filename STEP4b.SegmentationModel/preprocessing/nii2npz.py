@@ -8,6 +8,11 @@ from concurrent.futures import ProcessPoolExecutor
 import argparse
 import yaml
 
+"""
+    python nii2npz.py --src_path /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED --tgt_path /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --parts 6 --current_part 0
+
+"""
+
 lab_name_list = []
 
 #raise ValueError('Converting new files to npz will change the R-Super training set, breaking reproducibility and creating leakage of external test sets. If you wish to add more masks to the radiologist processed folder, you fist need to make training set Atlas a mandatory input in training. The masks that were processed by submission time are in /projects/bodymaps/Pedro/foundational/MedFormer/133K_dataset/133k_dataset_processed_masks_May_30_2025.csv')

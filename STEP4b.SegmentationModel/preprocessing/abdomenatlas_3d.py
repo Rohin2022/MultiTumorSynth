@@ -21,6 +21,12 @@ python abdomenatlas_3d.py --src_path /projects/bodymaps/Data/image_only/AbdomenA
 --label_names label_names.yaml
 
 
+    python abdomenatlas_3d.py --src_path /scratch/rpinise1/MultiTumorSynthesis/Combined2000Synthetic1970MasksUCSFTrain \
+--label_path /scratch/rpinise1/MultiTumorSynthesis/Combined2000Synthetic1970MasksUCSFTrain \
+--tgt_path /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED \
+--label_names label_names.yaml
+
+
 """
 
 
@@ -39,7 +45,7 @@ from concurrent.futures import ProcessPoolExecutor
 import argparse
 from functools import partial
 
-sitk.ProcessObject_SetGlobalDefaultNumberOfThreads(16)  # Set the number of threads (adjust to your hardware)
+sitk.ProcessObject_SetGlobalDefaultNumberOfThreads(35)  # Set the number of threads (adjust to your hardware)
 
 essential_organs = ['spleen', 'bladder', 'gall', 'pancreas', 'kidney', 'liver', 'adrenal', 'esophagus', 'stomach', 'duodenum', 'colon', 'uterus', 'prostate']
 

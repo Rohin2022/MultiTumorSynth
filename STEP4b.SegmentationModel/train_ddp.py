@@ -64,8 +64,19 @@ from utils import (
 
 
 """
-    python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name mask_only_model_name --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugDirV1 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_NPZ_V1 --epochs 100 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0
+    python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name mask_only_model_name --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugDirV1 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_NPZ_V1 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --epochs 100 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0
     
+
+     python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name mask_only_combined_data --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV2 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 25 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml
+
+     python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name v1_mask_only_synth_and_real_1_to_1 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV2 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 25 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml
+
+     python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name v2_mask_only_synth_and_real_1_to_1 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV2 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 40 --lr 0.001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml
+
+
+     python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name v2_mask_only_synth_and_real_1_to_1 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV2 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 40 --lr 0.001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml
+
+    python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name v2_mask_only_synth_and_real_1_to_1 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV2 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 40 --lr 0.001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml --resume --load ./exp/abdomenatlas/v2_mask_only_synth_and_real_1_to_1/fold_0_latest.pth
 
 """
 
@@ -182,6 +193,29 @@ def train_net(net, trainset, testset, args, ema_net=None, fold_idx=0):
     best_ASD = np.ones(args.classes) * 1000
     
     for epoch in range(args.start_epoch, args.epochs):
+
+        if is_master(args):
+            # save the latest checkpoint, including net, ema_net, and optimizer
+            print("SAVING MODEL")
+            net_state_dict, ema_net_state_dict = unwrap_model_checkpoint(net, ema_net, args)
+
+            save_checkpoint_atomic({
+                'epoch': epoch+1,
+                'model_state_dict': net_state_dict,
+                'ema_model_state_dict': ema_net_state_dict,
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, f"{args.cp_path}{args.dataset}/{args.unique_name}/fold_{fold_idx}_latest.pth")
+
+            if (epoch) % 5 == 0:
+                # save the model
+                save_checkpoint_atomic({
+                    'epoch': epoch+1,
+                    'model_state_dict': net_state_dict,
+                    'ema_model_state_dict': ema_net_state_dict,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                }, f"{args.cp_path}{args.dataset}/{args.unique_name}/fold_{fold_idx}_epoch_{epoch+1}.pth")
+
+        
         train_sampler.set_epoch(epoch)#this shuffles the dataset
         if hasattr(trainLoader.dataset, 'shuffle_atlas'):
             trainLoader.dataset.shuffle_atlas()
@@ -199,25 +233,6 @@ def train_net(net, trainset, testset, args, ema_net=None, fold_idx=0):
         # Evaluation, save checkpoint and log training info
         
         
-        if is_master(args):
-            # save the latest checkpoint, including net, ema_net, and optimizer
-            net_state_dict, ema_net_state_dict = unwrap_model_checkpoint(net, ema_net, args)
-
-            save_checkpoint_atomic({
-                'epoch': epoch+1,
-                'model_state_dict': net_state_dict,
-                'ema_model_state_dict': ema_net_state_dict,
-                'optimizer_state_dict': optimizer.state_dict(),
-            }, f"{args.cp_path}{args.dataset}/{args.unique_name}/fold_{fold_idx}_latest.pth")
-
-            if (epoch+1) % 25 == 0:
-                # save the model
-                save_checkpoint_atomic({
-                    'epoch': epoch+1,
-                    'model_state_dict': net_state_dict,
-                    'ema_model_state_dict': ema_net_state_dict,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                }, f"{args.cp_path}{args.dataset}/{args.unique_name}/fold_{fold_idx}_epoch_{epoch+1}.pth")
 
         #if False:
         if False and (epoch) % args.val_freq == 0 and (not args.clip_pretrain):
@@ -920,12 +935,17 @@ def init_network(args,classes=None,old_classes=None):
         
         if args.pretrained:
             try:
-                net.load_state_dict(torch.load(args.pretrained)['model_state_dict'], strict=False)  
-                print(f'Successfully loaded pretrained pre-trained model: {args.pretrained}, input shape is {args.training_size}')
-            except:
-                print(f'Your pretrained model has some parameter shape mismatch with the current model, maybe because of the output layer update. It was partially loaded though (in get_model, except for mismatched blocks).')
-                #net.load_state_dict(torch.load(args.pretrained)['model_state_dict'], strict=False)
-                net,_,_ = load_state_dict_best_effort(net,torch.load(args.pretrained)['model_state_dict'],verbose=True)
+                net.load_state_dict(torch.load(args.pretrained)['model_state_dict'], strict=False)
+                print(f'Successfully loaded pretrained pre-trained model: {args.pretrained}')
+            except Exception as e:
+                print(f'Shape mismatch loading {args.pretrained}: {e}. Falling back to best-effort load, '
+                    f'skipping output-layer keys already resolved by update_output_layer_onk.')
+                ckpt_sd = torch.load(args.pretrained)['model_state_dict']
+                matched = [k for k in ckpt_sd if k.startswith(('outc.', 'aux_out.'))]
+                print(matched)
+                skip_prefixes = ('outc.', 'aux_out.') if (args.update_output_layer or args.malignancy_classification) else ()
+                ckpt_sd = {k: v for k, v in ckpt_sd.items() if not k.startswith(skip_prefixes)}
+                net, _, _ = load_state_dict_best_effort(net, ckpt_sd, verbose=True)
                 
     if args.epai_stage_2:
         if net.inc.conv1.weight.shape[1] == 1:

@@ -10,12 +10,42 @@ python EvaluateResults.py \
 
 
 python EvaluateResults.py \
-    --pred_root /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/result/finetuned_model_turkish/abdomenatlas/mask_only_model_name \
+    --pred_root /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/result/new_loaded_version/abdomenatlas/mask_only_combined_data \
     --gt_root /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer \
     --label_names /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/preprocessing/label_names.yaml \
     --gt_subdir segmentations \
     --pred_subdir predictions \
     --output dice_results.csv \
+    --workers 8
+
+
+python EvaluateResults.py \
+    --pred_root /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/result/v1_epoch_16/abdomenatlas/v1_mask_only_synth_and_real_1_to_1 \
+    --gt_root /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer \
+    --label_names /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/preprocessing/label_names.yaml \
+    --gt_subdir segmentations \
+    --pred_subdir predictions \
+    --output dice_results.csv \
+    --workers 8
+
+
+python EvaluateResults.py \
+    --pred_root /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/result/v1_epoch_final/abdomenatlas/v1_mask_only_synth_and_real_1_to_1 \
+    --gt_root /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer \
+    --label_names /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/preprocessing/label_names.yaml \
+    --gt_subdir segmentations \
+    --pred_subdir predictions \
+    --output dice_results_final.csv \
+    --workers 8
+
+
+python EvaluateResults.py \
+    --pred_root /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/result/v2_epoch_final/abdomenatlas/v2_mask_only_synth_and_real_1_to_1 \
+    --gt_root /projects/bodymaps/Data/radiologist_annotations_merlin_ucsf_atlas_multi_cancer \
+    --label_names /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/preprocessing/label_names.yaml \
+    --gt_subdir segmentations \
+    --pred_subdir predictions \
+    --output dice_results_final_v2.csv \
     --workers 8
 
 """

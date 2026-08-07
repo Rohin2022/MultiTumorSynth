@@ -19,9 +19,17 @@ models=(
     #"./exp/abdomenatlas_ufo_multi_tumor/Dataset_133K_merlin_ucsf_attenuation_slice_loss_all_data_lr4_RSuperMTL_cls_on_segmentation_att_classifier_venous_only/fold_0_latest.pth"
     
     #"exp/abdomenatlas/mask_only_model_name/fold_0_latest.pth"
-    "/projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth"
-
+    #"/projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth" # ORIGINAL MODEL
+    #"/projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/exp/abdomenatlas/mask_only_model_name/fold_0_epoch_25.pth"
+    #"/projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/exp/abdomenatlas/mask_only_combined_data/fold_0_epoch_1.pth"
+    #"/projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/exp/abdomenatlas/mask_only_combined_data/fold_0_epoch_1.pth"
     #"./exp/abdomenatlas/clip_ft_UCSF133K/fold_0_latest.pth"
+    #"/projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/exp/abdomenatlas/v1_mask_only_synth_and_real_1_to_1/fold_0_epoch_11.pth"
+    #"/projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/exp/abdomenatlas/v1_mask_only_synth_and_real_1_to_1/fold_0_epoch_16.pth"
+    #"/projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/exp/abdomenatlas/v1_mask_only_synth_and_real_1_to_1/fold_0_latest.pth"
+    "/projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/exp/abdomenatlas/v2_mask_only_synth_and_real_1_to_1/fold_0_latest.pth"
+
+
     #"./exp/abdomenatlas_ufo_multi_tumor/Dataset_133K_merlin_ucsf_attenuation_slice_loss_all_data_lr4_RSuperMTL_cls_on_segmentation_att_classifier_venous_only_no_mask/fold_0_latest.pth"
     #"./exp/abdomenatlas_ufo_multi_tumor/Dataset_133K_merlin_ucsf_attenuation_slice_loss_all_data_lr4_RSuperMTL_cls_on_segmentation_att_classifier_venous_only_50_masks/fold_0_latest.pth"
     #"./exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch_50_masks/fold_0_latest.pth"
@@ -69,9 +77,9 @@ run_model() {
     while [[ "${attempt}" -le "${max_retries}" ]]; do
         python predict_abdomenatlas.py --load "${model}" \
             --img_path "${test_set}" \
-            --class_list /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml \
+            --class_list /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/preprocessing/label_names.yaml \
             --gpu ${gpu} --organ_mask_on_lesion ${extra_flag} \
-            --save_path ./result/baseline_model_turkish/ \
+            --save_path ./result/v2_epoch_final/ \
             --parts ${total_parts} --current_part ${current_part} \
             --ids /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/cross_eval/testing_ids_turkish.csv \
             --meta /projects/bodymaps/Data/metadata_ucsf_batch_1_to_6_and_merlin.csv \
@@ -79,6 +87,9 @@ run_model() {
             --disable_inference_2_stages
             #--overwrite \
             #--ids /projects/bodymaps/Data/Merlin/merlin_8tumor_cases_and_normal.csv
+
+             # use  /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml for regular model
+             # use /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/preprocessing/label_names.yaml for finetuned model
 
         rc=$?
         if [[ "${rc}" -eq 0 ]]; then

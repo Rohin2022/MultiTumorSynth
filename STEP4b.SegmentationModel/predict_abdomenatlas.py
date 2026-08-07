@@ -1041,6 +1041,8 @@ if __name__ == '__main__':
     else:
         if 'BDMAP_ID' in pandas.read_csv(args.ids).columns:
             col = 'BDMAP_ID'
+        elif "bdmap" in pandas.read_csv(args.ids).columns:
+            col = "bdmap"
         else:
             col = 'BDMAP ID'
         ex = pandas.read_csv(args.ids)[col].tolist()[0]

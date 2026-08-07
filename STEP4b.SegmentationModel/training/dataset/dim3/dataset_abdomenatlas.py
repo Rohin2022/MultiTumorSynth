@@ -448,8 +448,9 @@ class AbdomenAtlasDataset(Dataset):
             #return self.load_augmented_data(idx)
             try:
                 return self.load_augmented_data(idx)#loads and returns data already augmented and pre-saved
-            except:
+            except Exception as e:
                 max_retries = 20
+                print(f"EXCEPTION {e}")
                 print('FAILED TO LOAD AUGMENTED DATA:', self.img_list[idx], self.lab_list[idx], flush=True, file=sys.stderr)
                 for t in range(max_retries):
                     #change index to another one at random

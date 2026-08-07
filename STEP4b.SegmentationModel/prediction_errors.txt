@@ -41,3 +41,5 @@
 /projects/bodymaps/Data/UCSF_batch_1_to_5_and_merlin_medformer_npz_symlinks/BDMAP_00042825.npz/ct.nii.gz
 /projects/bodymaps/Data/UCSF_batch_1_to_5_and_merlin_medformer_npz_symlinks/BDMAP_00130084.npz/ct.nii.gz
 /projects/bodymaps/Data/UCSF_batch_1_to_5_and_merlin_medformer_npz_symlinks/BDMAP_00075255.npz/ct.nii.gz
+/projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/BDMAP_00376011/ct.nii.gz/ct.nii.gz
+/projects/bodymaps/Data/image_only/AbdomenAtlasPro/AbdomenAtlasPro/BDMAP_00376978/ct.nii.gz/ct.nii.gz

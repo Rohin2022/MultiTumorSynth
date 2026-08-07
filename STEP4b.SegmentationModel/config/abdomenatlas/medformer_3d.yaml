@@ -1,6 +1,6 @@
 #DATA
 #data_root: /fastwork/psalvador/JHU/data/atlas_300_medformer_npy/ccvl/net/ccvl15/pedro/atlas_300_medformer_npy/
-data_root: /projects/bodymaps/Pedro/data/atlas_300_medformer_npz/
+data_root: /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ
 #UFO_root: /projects/bodymaps/Pedro/data/UFO_medformer_npz/
 #jhh_root: /projects/bodymaps/Pedro/data/JHH_medformer_npz/
 #reports: /projects/bodymaps/Data/UCSFLLMOutputLarge27k.csv
@@ -8,7 +8,7 @@ data_root: /projects/bodymaps/Pedro/data/atlas_300_medformer_npz/
 #atlas_meta: /projects/bodymaps/Data/AbdomenAtlas3.0.csv
 #ufo_meta: /projects/bodymaps/Data/UCSF_metadata_filled.csv
 #jhh_meta: /projects/bodymaps/Pedro/data/JHH_trainset_meta_tumorlevel.csv
-classes: 42
+classes: 18
 modality: CT
 #original_spacing_list: /projects/bodymaps/Data/AbdomenAtlasPro_spacing.csv
 
