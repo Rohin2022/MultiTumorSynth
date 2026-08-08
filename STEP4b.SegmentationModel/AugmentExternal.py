@@ -9,11 +9,21 @@ import tqdm
 
     python AugmentExternal.py --dataset atlas --model medformer --dimension 3d --batch_size 2 --crop_on_tumor --workers_overwrite 4 --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV2 --dataset_path /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ
 
+
+    1:1 ratio
+    python AugmentExternal.py --dataset atlas_synthetic_balanced --model medformer --dimension 3d \
+  --batch_size 2 --crop_on_tumor --workers_overwrite 4 \
+  --tumor_classes gallbladder bladder spleen uterus prostate esophagus colon stomach duodenum \
+  --synth_real_ratio 1.0 --synth_real_csv /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/cross_eval/is_synthetic.csv --uniform_synthetic \
+  --dataset_path /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ \
+  --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV3 
+
+  
+
 """
 
 
 #python dataset_abdomenatlas.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --crop_on_tumor --save_destination /fastwork/psalvador/JHU/data/atlas_300_medformer_augmented_npy_augmented_multich_crop_on_tumor/ --crop_on_tumor --multi_ch_tumor --workers_overwrite 10
-
 
 def main():
     """
@@ -66,6 +76,21 @@ def main():
     parser.add_argument('--benign_col', type=str, default='radiology_benign_ICD_pathology_ok', help='column indicating benign cases')
     parser.add_argument('--training_size', type=int, default=None, help='the size of the training patch/crop')
     parser.add_argument('--upsample_malig_benign', action='store_true', help='upsamples pathology confirmed benigns and malignants')
+
+    parser.add_argument('--synth_real_ratio', type=float, default=None,
+                    help='Fraction of samples drawn from synthetic cases (e.g. 0.7 = 70%% synthetic, '
+                         '30%% real). If not set, no ratio control is applied.')
+    parser.add_argument('--synth_real_csv', type=str, default=None,
+                        help='CSV with columns BDMAP_ID, is_synthetic (0/1). Required if --synth_real_ratio, '
+                            '--uniform_synthetic, or --uniform_real is set.')
+    parser.add_argument('--uniform_synthetic', action='store_true',
+                        help='Uniformly sample across organ classes within the synthetic cases.')
+    parser.add_argument('--uniform_real', action='store_true',
+                        help='Uniformly sample across organ classes within the real cases.')
+    parser.add_argument('--atlas_tumor_stats_csv', type=str, default=None,
+                        help='CSV with BDMAP_ID + one presence column per organ/tumor class. Needed for uniform '
+                            'sampling on per-voxel-annotated (atlas) cases, since organ presence for those '
+                            'is not otherwise known without loading the full label volume.')
     
     args = parser.parse_args()
 
@@ -127,6 +152,8 @@ def main():
     elif args.dataset == 'atlas_jhh_ufo':
         import training.dataset.dim3.dataset_abdomenatlas_JHH_UFO as abdomenatlas
         print('Running JHH+atlas+UFO')
+    elif args.dataset == 'atlas_synthetic_balanced':
+        import training.dataset.dim3.dataset_abdomenatlas_synthetic as abdomenatlas
     else:
         raise ValueError("The specified dataset doesn't exist: %s"%args.dataset)
 
@@ -153,7 +180,11 @@ def main():
                 Atlas_only=args.Atlas_only,
                 UFO_only=args.UFO_only,
                 tumor_classes=tumor_classes,
-                load_slices=args.slice_loss
+                load_slices=args.slice_loss,
+                synth_real_ratio=args.synth_real_ratio,
+                synth_real_csv=args.synth_real_csv,
+                uniform_synthetic=args.uniform_synthetic,
+                uniform_real=args.uniform_real,
             )
         else:
             train_dataset = abdomenatlas.AbdomenAtlasDataset(
@@ -167,7 +198,11 @@ def main():
                     save_augmented=True,
                     Atlas_only=args.Atlas_only,
                     UFO_only=args.UFO_only,
-                    load_slices=args.slice_loss
+                    load_slices=args.slice_loss,
+                    synth_real_ratio=args.synth_real_ratio,
+                    synth_real_csv=args.synth_real_csv,
+                    uniform_synthetic=args.uniform_synthetic,
+                    uniform_real=args.uniform_real,
                 )
     else:
         if tumor_classes is not None:
@@ -181,7 +216,11 @@ def main():
                 all_train=True,
                 save_augmented=True,
                 tumor_classes=tumor_classes,
-                load_slices=args.slice_loss
+                load_slices=args.slice_loss,
+                synth_real_ratio=args.synth_real_ratio,
+                synth_real_csv=args.synth_real_csv,
+                uniform_synthetic=args.uniform_synthetic,
+                uniform_real=args.uniform_real,
             )
         else:
             train_dataset = abdomenatlas.AbdomenAtlasDataset(
@@ -193,7 +232,11 @@ def main():
                     gigantic_length=False,
                     all_train=True,
                     save_augmented=True,
-                    load_slices=args.slice_loss
+                    load_slices=args.slice_loss,
+                    synth_real_ratio=args.synth_real_ratio,
+                    synth_real_csv=args.synth_real_csv,
+                    uniform_synthetic=args.uniform_synthetic,
+                    uniform_real=args.uniform_real,
                 )
 
 
@@ -222,4 +265,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

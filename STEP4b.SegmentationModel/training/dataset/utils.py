@@ -138,6 +138,27 @@ def get_dataset(args, mode, **kwargs):
                                        all_train=args.all_train, crop_on_tumor=args.crop_on_tumor,
                                        load_augmented=args.load_augmented, save_destination=args.save_destination,
                                        save_augmented=args.save_augmented)
+
+        elif args.dataset == 'atlas_synthetic_balanced':
+            from .dim3.dataset_abdomenatlas_synthetic import AbdomenAtlasDataset
+
+            tumor_classes = args.tumor_classes if getattr(args, 'tumor_classes', None) else None
+
+            return AbdomenAtlasDataset(
+                args=args,
+                mode=mode,
+                seed=args.split_seed,
+                all_train=args.all_train,
+                crop_on_tumor=args.crop_on_tumor,
+                load_augmented=args.load_augmented,
+                save_destination=args.save_destination,
+                save_augmented=args.save_augmented,
+                tumor_classes=tumor_classes,
+                synth_real_ratio=getattr(args, 'synth_real_ratio', None),
+                synth_real_csv=getattr(args, 'synth_real_csv', None),
+                uniform_synthetic=getattr(args, 'uniform_synthetic', False),
+                uniform_real=getattr(args, 'uniform_real', False),
+            )
         else:
             raise ValueError("The specified dataset doesn't exist: %s" % args.dataset)
             

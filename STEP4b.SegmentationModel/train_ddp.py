@@ -78,6 +78,17 @@ from utils import (
 
     python train_ddp.py --dataset abdomenatlas --model medformer --dimension 3d --batch_size 2 --unique_name v2_mask_only_synth_and_real_1_to_1 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV2 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 40 --lr 0.001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml --resume --load ./exp/abdomenatlas/v2_mask_only_synth_and_real_1_to_1/fold_0_latest.pth
 
+
+
+    python train_ddp.py --dataset atlas_synthetic_balanced --model medformer --dimension 3d --batch_size 2 --unique_name v3_mask_only_synth_and_real_1.0 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV3 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 50 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml --synth_real_ratio 1.0 --synth_real_csv /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/cross_eval/is_synthetic.csv 
+
+
+    python train_ddp.py --dataset atlas_synthetic_balanced --model medformer --dimension 3d --batch_size 2 --unique_name v4_mask_only_synth_and_real_0.5 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV4 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 50 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml --synth_real_ratio 0.5 --synth_real_csv /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/cross_eval/is_synthetic.csv 
+
+
+    python train_ddp.py --dataset atlas_synthetic_balanced --model medformer --dimension 3d --batch_size 2 --unique_name v5_mask_only_synth_and_real_0.25 --crop_on_tumor --gpu '0' --workers 4 --load_augmented --save_destination /scratch/rpinise1/MultiTumorSynthesis/SegTrain_AugCombinedV5 --data_root /scratch/rpinise1/MultiTumorSynthesis/Synthetic_RSuperProcessed_VV2_COMBINED_NPZ --epochs 50 --lr 0.0001 --dist_url tcp://127.0.0.1:8001 --report_volume_loss_basic 0 --pretrain --pretrained /projects/bodymaps/Pedro/foundational/MedFormer/exp/abdomenatlas/PRETRAIN_UCSF_133K_and_Merlin_w0_many_cancers_100_epch/fold_0_latest.pth --update_output_layer --old_classes /projects/bodymaps/Pedro/data/UCSF_merlin_Sep16_radiologist_annotations_medformer_npz/list/label_names.yaml --synth_real_ratio 0.25 --synth_real_csv /projects/bodymaps/Rohin/TumorSynthesis/STEP4b.SegmentationModel/cross_eval/is_synthetic.csv 
+
+
 """
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -725,6 +736,19 @@ def get_parser():
     
     parser.add_argument('--ablation_no_organ_mask', action='store_true', help='Ablation that removes organ masks from the ball loss and volume loss, dropping performance. Be careful.')
     
+
+
+    # synthetic/real ratio control (mirrors AugmentExternal.py)
+    parser.add_argument('--synth_real_ratio', type=float, default=None,
+                    help='Fraction of samples drawn from synthetic cases (e.g. 0.7 = 70%% synthetic, '
+                         '30%% real). If not set, no ratio control is applied.')
+    parser.add_argument('--synth_real_csv', type=str, default=None,
+                        help='CSV with columns BDMAP_ID, is_synthetic (0/1). Required if --synth_real_ratio, '
+                            '--uniform_synthetic, or --uniform_real is set.')
+    parser.add_argument('--uniform_synthetic', action='store_true',
+                        help='Uniformly sample across organ classes within the synthetic cases.')
+    parser.add_argument('--uniform_real', action='store_true',
+                        help='Uniformly sample across organ classes within the real cases.')
 
 
     args = parser.parse_args()
