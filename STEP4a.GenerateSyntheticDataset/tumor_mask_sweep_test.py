@@ -143,7 +143,7 @@ def run_synthesize_tumor_with_override(radiomics_override, **synth_kwargs):
 
     tumor_gen_utils.sample_radiomics = _patched
     try:
-        return synthesize_tumor(**synth_kwargs, just_mask=False, cond_scale=4.0)
+        return synthesize_tumor(**synth_kwargs, just_mask=True, cond_scale=4.0)
     finally:
         tumor_gen_utils.sample_radiomics = original_fn
 
