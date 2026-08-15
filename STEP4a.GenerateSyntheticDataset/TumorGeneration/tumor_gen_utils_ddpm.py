@@ -28,7 +28,6 @@ from .diffusion_models.STEP3_ddpm import DDIMSampler as Tumor_DDIMSampler
 
 
 from .radiomics_sampler.utils import synthesize_organ_radiomics, split_tumor_shape_features, apply_normalization as apply_radiomics_normalization
-from .radiomics_sampler.utils import load_gmm_bank
 
 
 # --------------------------------------------------------------------------- #
@@ -208,96 +207,6 @@ def sample_radiomics(gmm_bank_path, organ):
     return {"mask_radiomics": mask_radiomics, "tumor_radiomics": tumor_radiomics}
 
 
-def _sample_from_gmm_bundle_local(bundle, n_samples):
-    """
-    Local duplicate of radiomics_sampler.utils._sample_from_gmm_bundle.
-    Exists so sample_radiomics_for_batch can load the GMM bank ONCE per
-    batch call and reuse the already-loaded bundle across every unique
-    organ in that batch, instead of synthesize_organ_radiomics() re-reading
-    and re-unpickling the bank file from disk on every call. Math is
-    identical: sample in PCA space, then invert pca -> scaler -> power
-    transform back into original radiomics units.
-    """
-    gmm = bundle["gmm"]
-    pca = bundle["pca"]
-    scaler = bundle["scaler"]
-    pt = bundle["power_transformer"]
-
-    z, _ = gmm.sample(n_samples)                # samples live in PCA space
-    x_scaled = pca.inverse_transform(z)         # -> standardized space
-    x_std = scaler.inverse_transform(x_scaled)  # -> power-transformed space
-    x = pt.inverse_transform(x_std)             # -> original radiomics units
-    return x  # (n_samples, n_features)
-
-
-def sample_radiomics_for_batch(gmm_bank_path, organ_types):
-    """
-    Batched radiomics sampling: loads the pickled GMM bank from disk ONCE
-    for the whole batch call (instead of once per sample, or once per
-    unique organ), groups samples by organ, and draws num_samples =
-    (count of that organ in the batch) from each organ's GMM in one call.
-
-    This duplicates the GMM-sampling path of
-    radiomics_sampler.utils.synthesize_organ_radiomics (the
-    reference_sample=None branch) rather than calling it directly, purely
-    so the loaded bank can be reused across organs within this batch;
-    radiomics_sampler/utils.py is left untouched. Sampled values are
-    identical in distribution to calling sample_radiomics per-item — same
-    GMM, same PCA/scaler/power-transform inversion, same feature split —
-    only the disk I/O and RNG batching change (one gmm.sample(k) draw per
-    organ instead of k separate gmm.sample(1) draws).
-
-    organ_types: list[str] of length B (ORGAN_TO_IDX keys, can repeat)
-
-    Returns: list[dict] of length B, in the same order as organ_types, each
-    shaped like sample_radiomics(...)'s return value
-        ({"mask_radiomics": {...}, "tumor_radiomics": {...}}).
-    """
-    bank = load_gmm_bank(gmm_bank_path)
-
-    organ_to_indices = {}
-    for i, organ in enumerate(organ_types):
-        organ_to_indices.setdefault(organ, []).append(i)
-
-    results = [None] * len(organ_types)
-
-    for organ, indices in organ_to_indices.items():
-        if organ not in bank:
-            raise KeyError(
-                f"Organ '{organ}' not found in GMM bank at {gmm_bank_path}. "
-                f"Available organs: {list(bank.keys())}"
-            )
-        bundle = bank[organ]
-        if "feature_names" not in bundle:
-            raise KeyError(
-                f"Bundle for organ '{organ}' has no 'feature_names' key. "
-                f"Re-save the GMM bank with feature_names included."
-            )
-        feature_names = bundle["feature_names"]
-
-        num_samples = len(indices)
-        x = _sample_from_gmm_bundle_local(bundle, n_samples=num_samples)
-
-        if x.shape[1] != len(feature_names):
-            raise ValueError(
-                f"Mismatch between sampled feature dim ({x.shape[1]}) and "
-                f"len(feature_names) ({len(feature_names)}) stored in bundle "
-                f"for organ '{organ}'."
-            )
-
-        sampled = {feat: x[:, j] for j, feat in enumerate(feature_names)}
-        tumor_features, shape_features = split_tumor_shape_features(
-            sampled, tumor_keys=TUMOR_COLUMNS, shape_keys=MASK_COLUMNS
-        )
-
-        for local_j, batch_idx in enumerate(indices):
-            mask_radiomics = {k: float(v[local_j]) for k, v in shape_features.items()}
-            tumor_radiomics = {k: float(v[local_j]) for k, v in tumor_features.items()}
-            results[batch_idx] = {"mask_radiomics": mask_radiomics, "tumor_radiomics": tumor_radiomics}
-
-    return results
-
-
 def get_size(radiomics):
     """Classify sampled tumor into a small/medium/large bucket from its volume feature."""
     mask_radiomics = radiomics["mask_radiomics"]
@@ -315,55 +224,13 @@ def get_size(radiomics):
 def build_cond_vector(organ_idx, numerical_dict, columns, device, batch_size=1,
                        num_organs=len(ORGAN_TO_IDX)):
     """Builds the tabular conditioning vector: one-hot organ + numerical radiomics,
-    matching the training-time `prepare_conditional_vector` layout.
-
-    Single-organ / single-radiomics-sample variant: builds one row and
-    repeats it across the batch dim. Kept for backwards compatibility with
-    single-sample callers (e.g. synthesize_tumor with batch_size=1). For a
-    batch with per-sample organs/radiomics, use build_cond_vector_batch
-    instead — that is what generate_tumor_mask_batch /
-    sample_tumor_appearance_batch call.
-    """
+    matching the training-time `prepare_conditional_vector` layout."""
     organ_tensor = torch.full((batch_size,), organ_idx, dtype=torch.long, device=device)
     organ_one_hot = F.one_hot(organ_tensor, num_classes=num_organs).float()
 
     vals = [numerical_dict[c] for c in columns]
     continuous = torch.tensor(vals, dtype=torch.float32, device=device)
     continuous = continuous.unsqueeze(0).repeat(batch_size, 1)
-
-    return torch.cat([organ_one_hot, continuous], dim=1)
-
-
-def build_cond_vector_batch(organ_indices, numerical_dicts, columns, device,
-                             num_organs=len(ORGAN_TO_IDX)):
-    """
-    Batched version of build_cond_vector: builds one row PER SAMPLE from that
-    sample's own organ index and own radiomics dict, instead of broadcasting
-    a single row across the batch. This is what allows a batch to mix organs
-    (e.g. ["duodenum", "prostate", "colon"]) in a single model call, with
-    each row of the resulting tabular_cond tensor correctly reflecting its
-    own sample's organ one-hot + radiomics values — exactly the per-sample
-    vector build_cond_vector would produce if called individually, just
-    stacked instead of repeated.
-
-    organ_indices: list[int] of length B (one ORGAN_TO_IDX value per sample)
-    numerical_dicts: list[dict] of length B (one radiomics dict per sample,
-        each keyed the same as `columns`)
-
-    Returns (B, num_organs + len(columns)) tensor.
-    """
-    assert len(organ_indices) == len(numerical_dicts), (
-        f"organ_indices has {len(organ_indices)} entries but "
-        f"numerical_dicts has {len(numerical_dicts)}"
-    )
-
-    organ_tensor = torch.tensor(organ_indices, dtype=torch.long, device=device)
-    organ_one_hot = F.one_hot(organ_tensor, num_classes=num_organs).float()
-
-    continuous = torch.tensor(
-        [[d[c] for c in columns] for d in numerical_dicts],
-        dtype=torch.float32, device=device,
-    )
 
     return torch.cat([organ_one_hot, continuous], dim=1)
 
@@ -477,79 +344,6 @@ def generate_tumor_mask(mask_tester, organ, m_organ_mask, organ_mask, heatmap, r
     return output_mask
 
 
-def generate_tumor_mask_batch(mask_tester, organs, m_organ_mask, organ_mask, heatmap, radiomics_list, device,
-                               ddim_steps=50, cond_scale=1.0, dim_size=32,
-                               mask_threshold=0.5, apply_fill_holes=True):
-    """
-    Batched version of generate_tumor_mask: samples the tumor-shape mask for
-    the WHOLE batch in a single DDIM sampling call, with each sample's own
-    organ and own sampled radiomics correctly reflected in that sample's row
-    of the tabular conditioning tensor (via build_cond_vector_batch) — this
-    is what makes it safe to mix organs within a batch (e.g. duodenum,
-    prostate, colon all in the same call).
-
-    organs: list[str] of length B (ORGAN_TO_IDX keys, one per sample)
-    m_organ_mask / organ_mask / heatmap: (B, 1, X, Y, Z) tensors
-    radiomics_list: list[dict] of length B, each shaped like
-        sample_radiomics(...)'s return value for that sample's organ
-
-    Returns a (B, 1, X, Y, Z) float tensor with 1 = tumor, 0 = background.
-    Identical math to generate_tumor_mask per-sample; only the model call
-    and the size-dependent organ-clipping are vectorized across the batch.
-    """
-    batch_size = m_organ_mask.shape[0]
-    assert len(organs) == batch_size, f"organs has {len(organs)} entries but batch size is {batch_size}"
-    assert len(radiomics_list) == batch_size, (
-        f"radiomics_list has {len(radiomics_list)} entries but batch size is {batch_size}"
-    )
-
-    organ_indices = [ORGAN_TO_IDX[o] for o in organs]
-    mask_radiomics_list = [r["mask_radiomics"] for r in radiomics_list]
-
-    cond = build_mask_spatial_cond(m_organ_mask, heatmap, device)
-    tabular_cond = build_cond_vector_batch(
-        organ_indices, mask_radiomics_list, MASK_COLUMNS, device
-    )
-
-    ddim_sampler = Mask_DDIMSampler(mask_tester.ema_model)
-    with torch.no_grad():
-        img_out, _ = ddim_sampler.sample(
-            ddim_steps, batch_size, (1, dim_size, dim_size, dim_size),
-            conditioning=cond, tabular_cond=tabular_cond, cond_scale=cond_scale,
-        )
-
-    # invert the (B,C,Z,X,Y) permutation used for conditioning, back to (B,C,X,Y,Z)
-    recon = img_out.permute(0, 1, -2, -1, -3)
-    recon_01 = (recon + 1.0) / 2.0
-
-    rescaled_recon_01 = F.interpolate(recon_01, size=(128, 128, 128), mode="trilinear", align_corners=False)
-
-    # training convention: background=1, tumor=0 -> tumor is where value < threshold
-    binary_mask = (rescaled_recon_01 < mask_threshold).to(torch.uint8)
-    if apply_fill_holes:
-        binary_mask = _apply_fill_holes(binary_mask)
-
-    output_mask = binary_mask.float().to(device)
-
-    # Size-dependent organ-clipping is per-sample: each sample's own sampled
-    # radiomics decides whether ITS tumor gets clipped to stay inside the
-    # organ mask. Build a per-sample boolean clip mask and apply it only to
-    # the rows that need it, leaving "large"/"medium" samples untouched —
-    # exactly matching what calling generate_tumor_mask per-sample would do.
-    sizes = [get_size(r) for r in radiomics_list]
-    clip_indices = [i for i, s in enumerate(sizes) if s not in ("large", "medium")]
-
-    if clip_indices:
-        organ_mask_t = torch.as_tensor(organ_mask, device=device, dtype=torch.float32)
-        idx_tensor = torch.tensor(clip_indices, device=device, dtype=torch.long)
-
-        clipped = (output_mask.index_select(0, idx_tensor) * organ_mask_t.index_select(0, idx_tensor)) >= 1
-        output_mask = output_mask.clone()
-        output_mask[idx_tensor] = clipped.float()
-
-    return output_mask
-
-
 # --------------------------------------------------------------------------- #
 # Tumor-model spatial conditioning + manual reverse-diffusion sampling
 #
@@ -636,59 +430,6 @@ def sample_tumor_appearance(tumor_tester, ct_volume, tumor_mask, radiomics, orga
     )
 
     batch_size = ct_volume.shape[0]
-    noisy_latent = torch.randn(latent_shape, device=device)
-
-    with torch.no_grad():
-        for i in reversed(range(diffusion.num_timesteps)):
-            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            noisy_latent = diffusion.p_sample(
-                noisy_latent, t,
-                cond=spatial_cond,
-                tabular_cond=tabular_cond,
-                cond_scale=cond_scale,
-                clip_denoised=True,
-            )
-
-        ct_synth = decode_latent(noisy_latent, vqgan)  # (B, 1, X, Y, Z), in [-1, 1]
-
-    return ct_synth
-
-
-def sample_tumor_appearance_batch(tumor_tester, ct_volume, tumor_mask, radiomics_list, organs, device,
-                                   cond_scale=1.0):
-    """
-    Batched version of sample_tumor_appearance: runs ONE manual
-    reverse-diffusion loop in VQGAN latent space over the whole batch, with
-    each sample's own organ and own sampled radiomics reflected in its row
-    of the tabular conditioning tensor (via build_cond_vector_batch), so
-    organs can differ freely within the batch.
-
-    ct_volume / tumor_mask: (B, 1, X, Y, Z)
-    radiomics_list: list[dict] of length B
-    organs: list[str] of length B (ORGAN_TO_IDX keys)
-
-    Returns a (B, 1, X, Y, Z) tensor, in [-1, 1]. Same per-timestep
-    reverse-diffusion math as sample_tumor_appearance; the only difference is
-    tabular_cond has one row per sample instead of one row broadcast to all
-    (which is what makes correct batching possible here in the first place).
-    """
-    batch_size = ct_volume.shape[0]
-    assert len(radiomics_list) == batch_size, (
-        f"radiomics_list has {len(radiomics_list)} entries but batch size is {batch_size}"
-    )
-    assert len(organs) == batch_size, f"organs has {len(organs)} entries but batch size is {batch_size}"
-
-    diffusion = tumor_tester.ema_model
-    vqgan = diffusion.vqgan
-
-    organ_indices = [ORGAN_TO_IDX[o] for o in organs]
-    tumor_radiomics_list = [r["tumor_radiomics"] for r in radiomics_list]
-
-    spatial_cond, latent_shape = build_tumor_spatial_cond(ct_volume, tumor_mask, vqgan, device)
-    tabular_cond = build_cond_vector_batch(
-        organ_indices, tumor_radiomics_list, TUMOR_COLUMNS, device
-    )
-
     noisy_latent = torch.randn(latent_shape, device=device)
 
     with torch.no_grad():
@@ -804,13 +545,7 @@ def prepare_tumor_model(device, cfg):
 
 
 # --------------------------------------------------------------------------- #
-# Full synthesis + blending (single sample)
-#
-# UNCHANGED from the original implementation — this is the exact per-sample
-# generation logic. Batch generation (below) calls this once per item in the
-# batch so that each sample's organ-specific radiomics sampling and
-# conditioning are computed independently and correctly, without altering
-# any of the underlying math here.
+# Full synthesis + blending
 # --------------------------------------------------------------------------- #
 def synthesize_tumor(ct_volume, organ_mask, heatmap, m_organ_mask, organ_type, mask_tester, tumor_tester, gmm_bank_path, tumor_norm_stats, mask_norm_stats,
                       cond_scale=1.0, ddim_steps=50, mask_dim_size=32, mask_threshold=0.5,
@@ -899,132 +634,3 @@ def synthesize_tumor(ct_volume, organ_mask, heatmap, m_organ_mask, organ_type, m
 
     final_volume_hu = final_volume_ * (hu_max - hu_min) + hu_min
     return final_volume_hu, tumor_mask, radiomics
-
-
-# --------------------------------------------------------------------------- #
-# Batch synthesis
-#
-# IMPORTANT: this does NOT change any generation math. `synthesize_tumor`
-# above is called once per item in the batch, exactly as it was called
-# before in the single-sample driver loop. This just gives you a single
-# entry point that takes a batch dict (as produced by the dataloader, with
-# leading batch dimension B) and returns a list of B per-sample results,
-# each computed with that sample's own organ / radiomics / conditioning.
-#
-# Per-sample organs can differ freely within a batch. Radiomics are still
-# sampled per-sample (one sample_radiomics() call per item, since that's a
-# lightweight GMM draw, not a model forward pass, and the underlying
-# synthesize_organ_radiomics/apply_normalization utilities are per-organ
-# black boxes we don't want to guess a batched signature for). What IS
-# genuinely batched — the actual DDPM/DDIM model calls, which is where the
-# compute and the throughput win are — is:
-#   - ONE Mask_DDIMSampler.sample(...) call for the whole batch
-#     (generate_tumor_mask_batch), with each row of tabular_cond built from
-#     that sample's own organ + own sampled radiomics.
-#   - ONE manual reverse-diffusion loop over diffusion.num_timesteps for the
-#     whole batch (sample_tumor_appearance_batch), again with per-sample
-#     tabular_cond rows.
-# No model call mixes one sample's organ into another's conditioning row;
-# each row of every batched tensor here is independently correct for that
-# sample, matching what synthesize_tumor would produce if called on that
-# sample alone — the difference is the model only runs once per DDIM
-# step / reverse-diffusion step for the whole batch instead of once per
-# step per sample.
-# --------------------------------------------------------------------------- #
-def synthesize_tumor_batch(ct_batch, organ_mask_batch, heatmap_batch, m_organ_mask_batch,
-                            organ_types, mask_tester, tumor_tester, gmm_bank_path,
-                            tumor_norm_stats, mask_norm_stats,
-                            cond_scale=1.0, ddim_steps=50, mask_dim_size=32, mask_threshold=0.5,
-                            apply_fill_holes=True, heatmap_sigma=DEFAULT_HEATMAP_SIGMA,
-                            hu_min=-1000.0, hu_max=500.0, just_mask=False):
-    """
-    Proper batched synthesis: runs the mask DDIM sampler and the tumor
-    latent-diffusion reverse process each ONCE for the entire batch (not
-    once per sample), while still sampling and applying each sample's own
-    organ-specific radiomics and one-hot organ conditioning correctly.
-
-    ct_batch / organ_mask_batch / heatmap_batch / m_organ_mask_batch:
-        (B, 1, X, Y, Z) tensors.
-    organ_types: list of length B, one organ string per sample (can differ
-        freely across the batch, e.g. ["duodenum", "prostate", "colon"]).
-
-    Returns a list of length B of (final_volume, tumor_mask, radiomics)
-    tuples, each shaped (1, 1, X, Y, Z) / (1, 1, X, Y, Z) / dict — same
-    per-sample format synthesize_tumor returns, just produced by batched
-    model calls instead of per-sample ones.
-    """
-    device = ct_batch.device
-    batch_size = ct_batch.shape[0]
-    assert len(organ_types) == batch_size, (
-        f"organ_types has {len(organ_types)} entries but batch size is {batch_size}"
-    )
-
-    # 1. Sample a target radiomics profile per sample, from that sample's
-    # own organ. Uses the batched sampler: loads the GMM bank once for the
-    # whole batch call and draws one gmm.sample(k) per unique organ
-    # (k = how many times that organ appears in this batch) instead of
-    # reloading the bank and drawing one sample at a time per item.
-    radiomics_list = sample_radiomics_for_batch(gmm_bank_path, organ_types)
-    normalized_radiomics_list = [
-        apply_radiomics_normalization(r, tumor_norm_stats, mask_norm_stats) for r in radiomics_list
-    ]
-
-    m_organ_mask_t = torch.as_tensor(m_organ_mask_batch, dtype=torch.float32, device=device)
-    organ_mask_t = torch.as_tensor(organ_mask_batch, dtype=torch.float32, device=device)
-    heatmap_t = torch.as_tensor(heatmap_batch, dtype=torch.float32, device=device)
-
-    print(f"GENERATING TUMOR MASKS (batch of {batch_size})")
-    # 2. Generate tumor-shape masks for the whole batch in one DDIM call.
-    tumor_mask = generate_tumor_mask_batch(
-        mask_tester, organ_types, m_organ_mask_t, organ_mask_t, heatmap_t,
-        normalized_radiomics_list, device,
-        ddim_steps=ddim_steps, cond_scale=cond_scale, dim_size=mask_dim_size,
-        mask_threshold=mask_threshold, apply_fill_holes=apply_fill_holes,
-    )
-    print(f"Tumor masks contain {tumor_mask.sum(dim=(1, 2, 3, 4)).tolist()} voxels (per sample)")
-
-    tumor_mask = tumor_mask.float().to(device)
-
-    if just_mask:
-        return [
-            (None, tumor_mask[i:i + 1], None)
-            for i in range(batch_size)
-        ]
-
-    print(f"GENERATING TUMORS (batch of {batch_size})")
-    # 3. Synthesize tumor appearance for the whole batch in one
-    # reverse-diffusion loop.
-    sample = sample_tumor_appearance_batch(
-        tumor_tester, ct_batch, tumor_mask, normalized_radiomics_list, organ_types, device,
-        cond_scale=cond_scale,
-    )
-
-    # 4. Blend per-sample. The gaussian-blur sigma is randomized per sample
-    # (matching the original's per-call np.random.uniform(0, 4) — each
-    # sample gets its own independent draw, same as if synthesize_tumor had
-    # been called on it individually) and applied with a per-sample sigma
-    # via one gaussian_filter call per sample (scipy's gaussian_filter
-    # doesn't support a different sigma per batch element in a single call).
-    mask_01 = torch.clamp(tumor_mask, min=0.0, max=1.0)
-    mask_01_np = mask_01.cpu().numpy()
-
-    blurred_slices = []
-    for i in range(batch_size):
-        sigma = np.random.uniform(0, 4)
-        blurred_i = gaussian_filter(mask_01_np[i:i + 1] * 1.0, sigma=[0, 0, sigma, sigma, sigma])
-        blurred_slices.append(blurred_i)
-    mask_01_np_blur = np.concatenate(blurred_slices, axis=0)
-
-    volume_ = torch.clamp((ct_batch + 1.0) / 2.0, min=0.0, max=1.0)
-    sample_ = torch.clamp((sample + 1.0) / 2.0, min=0.0, max=1.0)
-
-    mask_01_blur = torch.from_numpy(mask_01_np_blur).to(device=device)
-    final_volume_ = (1 - mask_01_blur) * volume_ + mask_01_blur * sample_
-    final_volume_ = torch.clamp(final_volume_, min=0.0, max=1.0)
-
-    final_volume_hu = final_volume_ * (hu_max - hu_min) + hu_min
-
-    return [
-        (final_volume_hu[i:i + 1], tumor_mask[i:i + 1], radiomics_list[i])
-        for i in range(batch_size)
-    ]
