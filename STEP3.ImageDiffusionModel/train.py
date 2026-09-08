@@ -61,18 +61,25 @@ def run(cfg: DictConfig):
         loss_type=cfg.model.loss_type,
     ).cuda()
 
-    
+    val_dataset_cfg = OmegaConf.merge(
+        cfg.dataset,
+        cfg.val_dataset,
+    )
 
     train_dataloader, train_sampler, dataset_size = get_loader(cfg.dataset)
 
-    val_dataloader=None
+    val_dataloader, _, _ = get_loader(val_dataset_cfg)
+
+    #val_dataloader=None
 
     trainer = Trainer(
         diffusion,
         cfg=cfg,
         dataset=train_dataloader,
+        val_dataset=val_dataloader,
         train_batch_size=cfg.model.batch_size,
         save_and_sample_every=cfg.model.save_and_sample_every,
+        validate_every=cfg.model.get('validate_every', 1000),
         train_lr=cfg.model.train_lr,
         train_num_steps=cfg.model.train_num_steps,
         gradient_accumulate_every=cfg.model.gradient_accumulate_every,

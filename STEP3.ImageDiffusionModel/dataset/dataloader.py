@@ -7,7 +7,7 @@ from monai.config.type_definitions import NdarrayOrTensor
 from monai.utils.enums import TransformBackends
 from monai.transforms.transform import Transform, MapTransform
 from monai.config import DtypeLike, KeysCollection
-from monai.data import DataLoader, Dataset, list_data_collate, DistributedSampler, CacheDataset
+from monai.data import DataLoader, Dataset, list_data_collate, DistributedSampler, CacheDataset, MetaTensor
 from torch.utils.data import Subset
 from monai.transforms import (
     AsDiscrete,
@@ -175,10 +175,169 @@ class AugDataset(torch.utils.data.Dataset):
         return self.transform(self.base[idx])
 
 
+TUMOR_COLUMNS = ['attenuation_delta',
+                 'original_firstorder_10Percentile', 'original_firstorder_90Percentile', 'original_firstorder_Energy', 'original_firstorder_Entropy', 'original_firstorder_InterquartileRange', 'original_firstorder_Kurtosis', 'original_firstorder_Maximum', 'original_firstorder_Mean',
+                 'original_firstorder_MeanAbsoluteDeviation',
+                 'original_firstorder_Median',
+                 'original_firstorder_Minimum',
+                 'original_firstorder_Range',
+                 'original_firstorder_RobustMeanAbsoluteDeviation',
+                 'original_firstorder_RootMeanSquared',
+                 'original_firstorder_Skewness',
+                 'original_firstorder_TotalEnergy',
+                 'original_firstorder_Uniformity',
+                 'original_firstorder_Variance',
+                 'original_glcm_Autocorrelation',
+                 'original_glcm_ClusterProminence',
+                 'original_glcm_ClusterShade',
+                 'original_glcm_ClusterTendency',
+                 'original_glcm_Contrast',
+                 'original_glcm_Correlation',
+                 'original_glcm_DifferenceAverage',
+                 'original_glcm_DifferenceEntropy',
+                 'original_glcm_DifferenceVariance',
+                 'original_glcm_Id',
+                 'original_glcm_Idm',
+                 'original_glcm_Idmn',
+                 'original_glcm_Idn',
+                 'original_glcm_Imc1',
+                 'original_glcm_Imc2',
+                 'original_glcm_InverseVariance',
+                 'original_glcm_JointAverage',
+                 'original_glcm_JointEnergy',
+                 'original_glcm_JointEntropy',
+                 'original_glcm_MCC',
+                 'original_glcm_MaximumProbability',
+                 'original_glcm_SumAverage',
+                 'original_glcm_SumEntropy',
+                 'original_glcm_SumSquares',
+                 'original_gldm_DependenceEntropy',
+                 'original_gldm_DependenceNonUniformity',
+                 'original_gldm_DependenceNonUniformityNormalized',
+                 'original_gldm_DependenceVariance',
+                 'original_gldm_GrayLevelNonUniformity',
+                 'original_gldm_GrayLevelVariance',
+                 'original_gldm_HighGrayLevelEmphasis',
+                 'original_gldm_LargeDependenceEmphasis',
+                 'original_gldm_LargeDependenceHighGrayLevelEmphasis',
+                 'original_gldm_LargeDependenceLowGrayLevelEmphasis',
+                 'original_gldm_LowGrayLevelEmphasis',
+                 'original_gldm_SmallDependenceEmphasis',
+                 'original_gldm_SmallDependenceHighGrayLevelEmphasis',
+                 'original_gldm_SmallDependenceLowGrayLevelEmphasis',
+                 'original_glrlm_GrayLevelNonUniformity',
+                 'original_glrlm_GrayLevelNonUniformityNormalized',
+                 'original_glrlm_GrayLevelVariance',
+                 'original_glrlm_HighGrayLevelRunEmphasis',
+                 'original_glrlm_LongRunEmphasis',
+                 'original_glrlm_LongRunHighGrayLevelEmphasis',
+                 'original_glrlm_LongRunLowGrayLevelEmphasis',
+                 'original_glrlm_LowGrayLevelRunEmphasis',
+                 'original_glrlm_RunEntropy',
+                 'original_glrlm_RunLengthNonUniformity',
+                 'original_glrlm_RunLengthNonUniformityNormalized',
+                 'original_glrlm_RunPercentage',
+                 'original_glrlm_RunVariance',
+                 'original_glrlm_ShortRunEmphasis',
+                 'original_glrlm_ShortRunHighGrayLevelEmphasis',
+                 'original_glrlm_ShortRunLowGrayLevelEmphasis',
+                 'original_glszm_GrayLevelNonUniformity',
+                 'original_glszm_GrayLevelNonUniformityNormalized',
+                 'original_glszm_GrayLevelVariance',
+                 'original_glszm_HighGrayLevelZoneEmphasis',
+                 'original_glszm_LargeAreaEmphasis',
+                 'original_glszm_LargeAreaHighGrayLevelEmphasis',
+                 'original_glszm_LargeAreaLowGrayLevelEmphasis',
+                 'original_glszm_LowGrayLevelZoneEmphasis',
+                 'original_glszm_SizeZoneNonUniformity',
+                 'original_glszm_SizeZoneNonUniformityNormalized',
+                 'original_glszm_SmallAreaEmphasis',
+                 'original_glszm_SmallAreaHighGrayLevelEmphasis',
+                 'original_glszm_SmallAreaLowGrayLevelEmphasis',
+                 'original_glszm_ZoneEntropy',
+                 'original_glszm_ZonePercentage',
+                 'original_glszm_ZoneVariance',
+                 'original_ngtdm_Busyness',
+                 'original_ngtdm_Coarseness',
+                 'original_ngtdm_Complexity',
+                 'original_ngtdm_Contrast',
+                 'original_ngtdm_Strength'
+                 ]
+
+
+METADATA_COLUMNS = ["image","label","organ", "bdmap_id"]
+
+SELECT_COLUMNS = METADATA_COLUMNS + TUMOR_COLUMNS
+
+
+class SelectTumorComponentd(MapTransform):
+    def __init__(self, keys, component_id_key="component_id", allow_missing_keys=False):
+        super().__init__(keys, allow_missing_keys)
+        self.component_id_key = component_id_key
+
+    def __call__(self, data):
+        d = dict(data)
+        component_id = int(d[self.component_id_key])
+        for key in self.key_iterator(d):
+            mask = d[key]
+
+            if isinstance(mask, MetaTensor):
+                # keep it a MetaTensor so downstream transforms (EnsureChannelFirstd, etc.)
+                # can still see original_channel_dim / affine / etc.
+                out = (mask.as_tensor() == component_id).to(mask.dtype)
+                d[key] = MetaTensor(out, meta=mask.meta)
+
+            elif isinstance(mask, torch.Tensor):
+                d[key] = (mask == component_id).to(mask.dtype)
+
+            else:
+                arr = np.asarray(mask)
+                d[key] = (arr == component_id).astype(arr.dtype)
+
+        return d
+
+
+ 
+import datetime
+
+def _log_cache_event(name, data):
+    """Prints whenever a deterministic transform actually executes (i.e. cache miss)."""
+    ct0 = data.get("ct0_bdmap", "?")
+    ct1 = data.get("ct1_bdmap", "?")
+    ts = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"[CACHE-BUILD {ts}] Running '{name}' for pair ({ct0} -> {ct1}) "
+          f"— this should print exactly once per pair per persistent cache.",
+          flush=True)
+
+
+class CacheRunLogger(Transform):
+    """
+    Wraps a deterministic transform and logs every time it is actually
+    executed. Must subclass Transform (not just be a plain callable) or
+    PersistentDataset._pre_transform will bail out on the first wrapped
+    transform in the Compose list and cache nothing (see prior debugging).
+
+    Use this to confirm: deterministic transforms run once per item when
+    building/populating the persistent cache, and never again afterward
+    (subsequent epochs should only exercise the stochastic crop stage).
+    """
+    def __init__(self, transform):
+        self.transform = transform
+        self.name = transform.__class__.__name__
+
+    def __call__(self, data):
+        if isinstance(data, list):
+            for d in data:
+                _log_cache_event(self.name, d)
+            return [self.transform(d) for d in data]
+        _log_cache_event(self.name, data)
+        return self.transform(data)
+
 def get_loader(args):
     train_transforms_deterministic = Compose(
         [
-            LoadImageh5d(keys=["image", "tumor_mask", "organ_mask"]),
+            CacheRunLogger(LoadImageh5d(keys=["image", "tumor_mask", "organ_mask"])),
+            SelectTumorComponentd(keys=["tumor_mask"]),
             EnsureChannelFirstd(keys=["image", "tumor_mask", "organ_mask"]),
             CombineMasksToTernaryd(
                 organ_key="organ_mask", tumor_key="tumor_mask", output_key="label"),
@@ -207,9 +366,7 @@ def get_loader(args):
                 args.roi_x, args.roi_y, args.roi_z), mode='constant'),
             ToTensord(keys=["image", "label"]),
             CastToTyped(keys=["label"], dtype=np.uint8),
-            SelectItemsd(keys=["image","label","attenuation_mean", "attenuation_stdev", "attenuation_delta",
-            "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
-            "glcm_contrast", "glcm_autocorrelation", "glcm_idm", "num_components","organ", "bdmap_id"])
+            SelectItemsd(keys=SELECT_COLUMNS)
         ]
     )
 
@@ -293,21 +450,16 @@ def get_loader(args):
 
     # breakpoint()
     if args.phase == 'train':
-        tumor_metrics = pd.read_csv(os.path.join(
+        train_input = pd.read_csv(os.path.join(
             args.tumor_csv_path, args.dataset_list, f'{args.tumor_datafile}'))
 
-        tumor_mask_metrics = pd.read_csv(os.path.join(
-            args.tumor_csv_path, args.dataset_list, f'{args.tumor_masks_datafile}'
-        ))
+        train_input.dropna(inplace=True)
+        train_input = train_input[train_input["original_shape_LeastAxisLength"]>0.0]
 
-        tumor_mask_metrics.drop("organ", axis=1, inplace=True)
-
-        train_input = pd.merge(
-            tumor_metrics, tumor_mask_metrics, how="inner", on="bdmap_id")
         # print(train_input.columns)
         train_input["tumor_mask"] = train_input.apply(
             lambda row: os.path.join(args.segmentations_root_path, str(
-                row["bdmap_id"]), "segmentations", f"{row['organ']}_lesion.nii.gz"),
+                row["bdmap_id"]), "segmentations", f"{row['organ']}_lesion_labeled.nii.gz"),
             axis=1
         )
 
@@ -343,12 +495,12 @@ def get_loader(args):
         # 1. Drop invalid rows first
         train_input = train_input[train_input["organ"].isin(
             list(organ_mapping.keys()))]
-        train_input = train_input[train_input["volume_ml"] > 0.0]
+        train_input = train_input[train_input["original_shape_MeshVolume"] > 0.0]
 
-        # 2. CALCULATE WEIGHTS FIRST (While volume_ml is still in true mL)
-        vol_cutoff = float(train_input['volume_ml'].quantile(0.98))
+        # 2. CALCULATE WEIGHTS FIRST (While original_shape_MeshVolume is still in true mL)
+        vol_cutoff = float(train_input['original_shape_MeshVolume'].quantile(0.98))
         train_input['capped_volume'] = np.clip(
-            train_input['volume_ml'], a_min=0, a_max=vol_cutoff)
+            train_input['original_shape_MeshVolume'], a_min=0, a_max=vol_cutoff)
         train_input['volume_bin'] = pd.cut(
             train_input['capped_volume'], bins=5, labels=False)
 
@@ -372,10 +524,12 @@ def get_loader(args):
         from pandas.api.types import is_numeric_dtype
 
         stats_file = f"dataset_norm_stats_{args.results_folder_postfix}.json"
-        exclude_cols = ['volume_bin', 'sample_weight', 'organ',
-                        'tumor_mask', 'organ_mask', 'capped_volume', 'column_task', 'image', 'label',
-                        'diameter_x_mm', 'diameter_y_mm', 'diameter_z_mm', 'volume_ml',
-                        'sphericity', 'surface_volume_ratio', 'elongation', 'flatness', 'max_3d_diameter_mm']
+        #exclude_cols = ['volume_bin', 'sample_weight', 'organ',
+        #                'tumor_mask', 'organ_mask', 'capped_volume', 'column_task', 'image', 'label',
+        #                'diameter_x_mm', 'diameter_y_mm', 'diameter_z_mm', 'volume_ml',
+        #                'sphericity', 'surface_volume_ratio', 'elongation', 'flatness', 'max_3d_diameter_mm']
+
+        
 
         if os.path.exists(stats_file):
             print("Loading existing normalization statistics...")
@@ -385,7 +539,7 @@ def get_loader(args):
             print("Generating new normalization statistics...")
             normalization_stats = {}
             for key in train_input.columns:
-                if key in exclude_cols or not is_numeric_dtype(train_input[key]):
+                if key not in TUMOR_COLUMNS: # EXCLUDE ANHTHING THAT is NOT in tumor columns
                     continue
 
                 normalization_stats[key] = {
@@ -445,7 +599,7 @@ def get_loader(args):
             dataset=train_dataset, even_divisible=True, shuffle=True) if args.dist else None
         # breakpoint()
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), num_workers=args.num_workers,
-                                  collate_fn=list_data_collate, sampler=train_sampler, pin_memory=True, persistent_workers=True)
+                                  collate_fn=list_data_collate, sampler=train_sampler, pin_memory=args.pin_memory if args.pin_memory else True, persistent_workers=True)
         return train_loader, train_sampler, len(train_dataset)
         # return train_loader
 

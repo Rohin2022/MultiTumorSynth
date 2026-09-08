@@ -1,3 +1,4 @@
 defaults:
   - dataset: synt_ct 
   - model: ddpm 
+  - val_dataset: turkish_ct

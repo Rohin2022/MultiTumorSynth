@@ -1,0 +1,6 @@
+tumor_datafile: all_radiomics_test.csv
+persistent_cache_dir: /scratch/rpinise1/MultiTumorSynthesis/turkish_test_set
+pin_memory: False
+num_workers: 2
+batch_size: 10
+num_samples: 1

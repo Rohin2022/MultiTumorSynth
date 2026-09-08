@@ -8,7 +8,7 @@ unet_dim: 128
 out_dim: 8 # vqgan embed_dim
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/ddpm/
-results_folder_postfix: 'tumor_diffusion_vTEST' # v11 10 steps, v10 100 steps
+results_folder_postfix: 'tumor_diffusion_all_radiomics_500tsteps_UnetCA_128dim' # v11 10 steps, v10 100 steps
 load_milestone: True
 
 batch_size: 4 # 40

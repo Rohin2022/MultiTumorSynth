@@ -7,7 +7,7 @@ import torch
 from omegaconf import DictConfig, open_dict
 import hydra
 import os
-from ddpm import Unet3D, GaussianDiffusion, ResnetBlock, Unet3D_CA
+from ddpm import Unet3D, GaussianDiffusion, ResnetBlock, Unet3D_CA, TUMOR_COLUMNS
 from pathlib import Path
 from tqdm import tqdm
 
@@ -59,28 +59,33 @@ def denormalize_ct(ct_normalized, a_min, a_max, b_min=-1.0, b_max=1.0):
 
 def prepare_conditional_vector(data, device):
     """
-    Mirrors Trainer.prepare_conditional_vector() exactly.
-    Output shape: (B, 19)  ->  9 one-hot organ classes + 10 continuous features
-
-    This vector is built from the z-scored CSV-derived radiomics (raw,
-    unclipped HU space) — that's correct and unchanged, since the network
-    was trained with this exact conditioning provenance. Only the
-    *evaluation* comparison target changes (see below).
+    Extracts tabular features into a single tensor, one-hot encoding the organ.
+    Output shape: (Batch, 18) -> 9 organ classes + 9 numerical features
     """
-    numerical_features = [
-        "attenuation_mean", "attenuation_stdev", "attenuation_delta",
-        "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
-        "glcm_contrast", "glcm_autocorrelation", "glcm_idm", "num_components",
-    ]
-    organ_idx    = torch.as_tensor(data["organ"], dtype=torch.long, device=device).view(-1)
-    organ_one_hot = F.one_hot(organ_idx, num_classes=9).float()          # (B, 9)
+    numerical_features = TUMOR_COLUMNS
 
-    num_tensors = [
-        torch.as_tensor(data[k], dtype=torch.float32, device=device).view(-1)
-        for k in numerical_features
-    ]
-    continuous_vector = torch.stack(num_tensors, dim=1)                  # (B, 10)
-    return torch.cat([organ_one_hot, continuous_vector], dim=1)          # (B, 19)
+    # 1. Handle the categorical "organ" feature
+    organ_idx = torch.as_tensor(
+        data["organ"], dtype=torch.long, device=device).view(-1)
+
+    # One-hot encode to shape (Batch, 9) and cast back to float32
+    organ_one_hot = F.one_hot(organ_idx, num_classes=9).float()
+
+    # 2. Handle the remaining continuous numerical features
+    num_tensors = []
+    for key in numerical_features:
+        val = torch.as_tensor(
+            data[key], dtype=torch.float32, device=device).view(-1)
+        num_tensors.append(val)
+
+    # Stack continuous features to shape (Batch, 10)
+    continuous_vector = torch.stack(num_tensors, dim=1)
+
+    # 3. Concatenate the one-hot organ with the continuous features
+    # Resulting shape: (Batch, 18)
+    cond_vector = torch.cat([organ_one_hot, continuous_vector], dim=1)
+
+    return cond_vector
 
 
 def build_spatial_cond(image, mask, vqgan, device):
@@ -293,12 +298,7 @@ def get_denormalized_radiomics(data, idx, norm_stats):
     Extracts the radiomics conditioning values for one sample and
     converts them back from z-score normalized space to raw values.
     """
-    numerical_features = [
-        "attenuation_mean", "attenuation_stdev", "attenuation_delta",
-        "attenuation_skew", "attenuation_10th", "attenuation_uniformity",
-        "glcm_contrast", "glcm_autocorrelation", "glcm_idm",
-        "num_components",
-    ]
+    numerical_features = TUMOR_COLUMNS
 
     record = {}
 
@@ -390,7 +390,7 @@ def generate_samples(data, step, diffusion, vqgan, norm_stats, a_min, a_max, con
     ct_np   = ct_synth.cpu().numpy()
     mask_np = mask.numpy()
 
-    out_dir = Path("inference_output")
+    out_dir = Path("inference_output_noclip")
     out_dir.mkdir(exist_ok=True)
 
     spacing    = (1.0, 1.0, 1.0)
@@ -518,7 +518,7 @@ def reconstruct(cfg: DictConfig):
             dim_mults=cfg.model.dim_mults,
             channels=x_channels,
             out_dim=cfg.model.out_dim,
-            num_continuous_conditioners=10,
+            num_continuous_conditioners=len(TUMOR_COLUMNS),
             num_organs=9,
             cond_channels=cond_channels,
             num_res_blocks=2,
