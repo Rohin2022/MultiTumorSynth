@@ -2,7 +2,7 @@ from re import I
 import sys, os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.append(os.getcwd())
-from ddpm import Unet3D, GaussianDiffusion, Trainer, Unet3D_CA
+from ddpm import Unet3D, GaussianDiffusion, Trainer, Unet3D_CA, TUMOR_COLUMNS
 import hydra
 from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
@@ -24,7 +24,7 @@ def run(cfg: DictConfig):
             dim_mults=cfg.model.dim_mults,
             channels=cfg.model.diffusion_num_channels, # image (1) and tumor mask (1)
             out_dim=cfg.model.out_dim,
-            num_continuous_conditioners=10,
+            num_continuous_conditioners=len(TUMOR_COLUMNS),
             num_organs=9
         ).cuda()
     elif cfg.model.denoising_fn == 'Unet3D_CA':
@@ -36,7 +36,7 @@ def run(cfg: DictConfig):
             dim_mults=cfg.model.dim_mults,
             channels=x_channels,
             out_dim=cfg.model.out_dim,
-            num_continuous_conditioners=10,
+            num_continuous_conditioners=len(TUMOR_COLUMNS),
             num_organs=9,
             cond_channels=cond_channels,
             num_res_blocks=2,

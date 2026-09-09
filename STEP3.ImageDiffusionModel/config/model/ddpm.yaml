@@ -8,7 +8,7 @@ unet_dim: 128
 out_dim: 8 # vqgan embed_dim
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/ddpm/
-results_folder_postfix: 'tumor_diffusion_all_radiomics_500tsteps_UnetCA_128dim_v13' # v11 10 steps, v10 100 steps
+results_folder_postfix: 'tumor_diffusion_all_radiomics_500tsteps_UnetCA_128dim_v15' # v11 10 steps, v10 100 steps
 load_milestone: False
 
 batch_size: 8 # 40
@@ -16,7 +16,7 @@ num_workers: 16
 logger: wandb
 objective: pred_x0
 save_and_sample_every: 1000
-denoising_fn: Unet3D_CA
+denoising_fn: Unet3D
 train_lr: 1e-5
 timesteps: 500 # number of steps
 sampling_timesteps: 500 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
