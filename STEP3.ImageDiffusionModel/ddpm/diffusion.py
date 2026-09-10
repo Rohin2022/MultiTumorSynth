@@ -123,8 +123,8 @@ TUMOR_COLUMNS = ['attenuation_delta',
                  'original_ngtdm_Strength'
                  ]"""
 
-TUMOR_COLUMNS = ['original_firstorder_10Percentile', 'original_firstorder_90Percentile', 
-                 'original_firstorder_Entropy', 'original_firstorder_InterquartileRange', 
+TUMOR_COLUMNS = ['original_firstorder_10Percentile', 'original_firstorder_90Percentile',
+                 'original_firstorder_Entropy', 'original_firstorder_InterquartileRange',
                  'original_firstorder_Kurtosis', 'original_firstorder_Maximum', 'original_firstorder_Mean',
                  'original_firstorder_MeanAbsoluteDeviation',
                  'original_firstorder_Median',
@@ -687,6 +687,8 @@ class Unet3D(nn.Module):
         # additive channel.
         if exists(tabular_cond):
             emb_mask = drop_mask.view(batch, 1)
+            print(tabular_cond.shape)
+            print(tabular_cond)
 
             tabular_cond = torch.where(
                 emb_mask.bool(),
@@ -704,6 +706,7 @@ class Unet3D(nn.Module):
             # shape and crash.
             zeros = torch.zeros(batch, self.tabular_emb_dim,
                                 device=device, dtype=t.dtype)
+            print("IT DOES NOT EXIST")
             t = torch.cat([t, zeros], dim=-1)
 
         h = []
@@ -771,6 +774,8 @@ class GaussianDiffusion(nn.Module):
         use_dynamic_thres=False,
         dynamic_thres_percentile=0.9,
         vqgan_ckpt=None,
+        spatial_weight_loss=False,
+        tumor_weight=1.0
     ):
         super().__init__()
         self.channels = channels
@@ -842,6 +847,9 @@ class GaussianDiffusion(nn.Module):
 
         self.use_dynamic_thres = use_dynamic_thres
         self.dynamic_thres_percentile = dynamic_thres_percentile
+
+        self.spatial_weight_loss = spatial_weight_loss
+        self.tumor_weight = tumor_weight
 
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -938,7 +946,8 @@ class GaussianDiffusion(nn.Module):
 
         if isinstance(self.vqgan, VQGAN):
             _sample = (((_sample + 1.0) / 2.0) *
-                       (self.vqgan.codebook.embeddings.max() - self.vqgan.codebook.embeddings.min())
+                       (self.vqgan.codebook.embeddings.max() -
+                        self.vqgan.codebook.embeddings.min())
                        ) + self.vqgan.codebook.embeddings.min()
             _sample = self.vqgan.decode(_sample, quantize=True)
         else:
@@ -972,7 +981,9 @@ class GaussianDiffusion(nn.Module):
                     t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, cond=None, tabular_cond=None, textual_cond=None, noise=None, null_cond_prob=0.10, **kwargs):
+    def p_losses(self, x_start, t, cond=None, tabular_cond=None, textual_cond=None,
+                 noise=None, null_cond_prob=0.10, tumor_mask_latent=None,
+                 tumor_weight=1.0, **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -987,7 +998,15 @@ class GaussianDiffusion(nn.Module):
             x_noisy, t, cond=cond, tabular_cond=tabular_cond, null_cond_prob=null_cond_prob, **kwargs)
 
         if self.loss_type == 'l1':
-            loss = F.l1_loss(noise, x_recon)
+            if self.spatial_weight_loss:
+                assert exists(
+                    tumor_mask_latent), "tumor_mask_latent required when spatial_weight_loss=True"
+                elementwise_loss = (noise - x_recon).abs()
+                loss_weight = 1.0 + (tumor_weight - 1.0) * tumor_mask_latent
+                loss = (elementwise_loss * loss_weight).sum() / \
+                    loss_weight.sum()
+            else:
+                loss = F.l1_loss(noise, x_recon)
         elif self.loss_type == 'l2':
             loss = F.mse_loss(noise, x_recon)
         else:
@@ -996,20 +1015,14 @@ class GaussianDiffusion(nn.Module):
         return loss
 
     def forward(self, img, mask, tabular_cond, textual_cond=None, null_cond_prob=0.10, *args, **kwargs):
-        # 1. Extract binary tumor mask from ternary {0,1,2}
-        # {0,1} binary, tumor region only
         tumor_mask = (mask == 2).float().detach()
-        # 1=keep, 0=zero-out tumor region
         mask_ = (1 - tumor_mask).detach()
-        # CT with tumor region zeroed out
         masked_img = (img * mask_).detach()
 
-        # 2. Permute from (B, C, H, W, D) → (B, C, D, H, W) for VQGAN
         masked_img = masked_img.permute(0, 1, 4, 2, 3)
         img = img.permute(0, 1, 4, 2, 3)
         tumor_mask = tumor_mask.permute(0, 1, 4, 2, 3)
 
-        # 3. Encode through VQGAN and normalize with codebook min/max
         if isinstance(self.vqgan, VQGAN):
             with torch.no_grad():
                 emb_min = self.vqgan.codebook.embeddings.min()
@@ -1017,7 +1030,7 @@ class GaussianDiffusion(nn.Module):
                 emb_denom = emb_max - emb_min
 
                 img = self.vqgan.encode(
-                    img,        quantize=False, include_embeddings=True)
+                    img, quantize=False, include_embeddings=True)
                 masked_img = self.vqgan.encode(
                     masked_img, quantize=False, include_embeddings=True)
 
@@ -1026,20 +1039,27 @@ class GaussianDiffusion(nn.Module):
         else:
             raise RuntimeError("PLEASE USE VQGAN")
 
-        # 4. Build spatial conditioning
         cc = torch.nn.functional.interpolate(
-            tumor_mask * 2.0 - 1.0,        # {0,1} → {-1,1} ✅
+            tumor_mask * 2.0 - 1.0,
             size=masked_img.shape[-3:],
             mode='nearest'
         )
         cond = torch.cat((masked_img, cc), dim=1)
 
-        # 5. Timestep sampling and loss
+        tumor_mask_latent = None
+        if self.spatial_weight_loss:
+            tumor_mask_latent = torch.nn.functional.interpolate(
+                tumor_mask,
+                size=masked_img.shape[-3:],
+                mode='nearest'
+            )
+
         b, device = img.shape[0], img.device
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         return self.p_losses(
             img, t, cond=cond, tabular_cond=tabular_cond,
+            tumor_mask_latent=tumor_mask_latent, tumor_weight=self.tumor_weight,
             null_cond_prob=null_cond_prob, *args, **kwargs
         )
 
@@ -1086,6 +1106,10 @@ class Trainer(object):
         num_sample_rows=1,
         max_grad_norm=None,
         num_workers=20,
+        start_weight=1.0,
+        warmup_steps=1000,
+        end_weight=1.0,
+        spatial_weight_loss=False
     ):
         super().__init__()
         self.model = diffusion_model
@@ -1107,8 +1131,7 @@ class Trainer(object):
         self.len_dataloader = len(dl)
         self.dl = cycle(dl)
 
-
-        self.val_dl = val_dataset          
+        self.val_dl = val_dataset
         self.val_dl_iter = None
 
         self.validate_every = validate_every
@@ -1146,10 +1169,16 @@ class Trainer(object):
             os.makedirs(str(self.results_folder)+'/logs')
         self.writer = SummaryWriter(str(self.results_folder)+'/logs')
 
-        self.radiomics_evaluator = RadiomicsMetricsEvaluator(spacing=(1.0, 1.0, 1.0))
-
+        self.radiomics_evaluator = RadiomicsMetricsEvaluator(
+            spacing=(1.0, 1.0, 1.0))
 
         self.reset_parameters()
+
+        self.start_weight = start_weight
+        self.warmup_steps = warmup_steps
+        self.end_weight = end_weight
+
+        self.spatial_weight_loss = spatial_weight_loss
 
     def _next_val_batch(self):
         if self.val_dl is None:
@@ -1244,7 +1273,8 @@ class Trainer(object):
         self.model.eval()
         val_losses = []
 
-        n_batches = self.val_batches if self.val_batches is not None else len(self.val_dl)
+        n_batches = self.val_batches if self.val_batches is not None else len(
+            self.val_dl)
         for _ in range(n_batches):
             data = self._next_val_batch()
             if data is None:
@@ -1252,10 +1282,12 @@ class Trainer(object):
 
             image = data['image'].to(self.device)
             mask = data['label'].to(self.device)
-            tabular_cond = self.prepare_conditional_vector(data, device=self.device)
+            tabular_cond = self.prepare_conditional_vector(
+                data, device=self.device)
 
             with autocast(enabled=self.amp, dtype=torch.bfloat16):
-                loss = self.model(image, mask, tabular_cond, null_cond_prob=0.1)
+                loss = self.model(image, mask, tabular_cond,
+                                  null_cond_prob=0.1)
 
             if torch.isfinite(loss):
                 val_losses.append(loss.item())
@@ -1267,7 +1299,8 @@ class Trainer(object):
 
         mean_val_loss = sum(val_losses) / len(val_losses)
         self.writer.add_scalar('Val_Loss', mean_val_loss, self.step)
-        print(f"[step {self.step}] val_loss={mean_val_loss:.4f} (n={len(val_losses)})")
+        print(
+            f"[step {self.step}] val_loss={mean_val_loss:.4f} (n={len(val_losses)})")
         return mean_val_loss
 
     @torch.no_grad()
@@ -1280,7 +1313,8 @@ class Trainer(object):
         the cheap forward-pass evaluate().
         """
         if self.val_dl is None:
-            print(f"[step {self.step}] sample_and_visualize skipped: no val_dl provided")
+            print(
+                f"[step {self.step}] sample_and_visualize skipped: no val_dl provided")
             return
 
         print(f"\n--- Running inference at step {self.step} ---")
@@ -1303,12 +1337,13 @@ class Trainer(object):
             data = self._next_val_batch()
             if data is None:
                 print(f"[step {self.step}] sample_and_visualize: val_dl exhausted, "
-                    f"stopping with {collected}/{n_samples} samples")
+                      f"stopping with {collected}/{n_samples} samples")
                 break
 
             image = data['image'].to(self.device)
             mask = data['label'].to(self.device)
-            tabular_cond = self.prepare_conditional_vector(data, device=self.device)
+            tabular_cond = self.prepare_conditional_vector(
+                data, device=self.device)
 
             # Cap this batch so we don't overshoot n_samples on the last chunk
             take = min(image.shape[0], n_samples - collected)
@@ -1329,7 +1364,8 @@ class Trainer(object):
             emb_max = vqgan.codebook.embeddings.max()
             emb_denom = emb_max - emb_min
 
-            latent = vqgan.encode(masked_img_p, quantize=False, include_embeddings=True)
+            latent = vqgan.encode(
+                masked_img_p, quantize=False, include_embeddings=True)
             latent_n = ((latent - emb_min) / emb_denom) * 2.0 - 1.0
 
             cc = F.interpolate(
@@ -1344,9 +1380,10 @@ class Trainer(object):
             noisy_latent = torch.randn(latent_shape, device=self.device)
 
             for i in tqdm(reversed(range(self.ema_model.num_timesteps)),
-                        desc=f"Sampling cfg={cond_scale} ({collected}/{n_samples})",
-                        leave=False):
-                t = torch.full((take,), i, device=self.device, dtype=torch.long)
+                          desc=f"Sampling cfg={cond_scale} ({collected}/{n_samples})",
+                          leave=False):
+                t = torch.full((take,), i, device=self.device,
+                               dtype=torch.long)
                 noisy_latent = self.ema_model.p_sample(
                     noisy_latent, t,
                     cond=spatial_cond,
@@ -1362,7 +1399,8 @@ class Trainer(object):
 
             # VQGAN Autoencode (Original Image In & Out)
             image_p = image_s.permute(0, 1, 4, 2, 3)
-            latent_orig = vqgan.encode(image_p, quantize=False, include_embeddings=True)
+            latent_orig = vqgan.encode(
+                image_p, quantize=False, include_embeddings=True)
             decoded_orig = vqgan.decode(latent_orig, quantize=True)
             ct_vqgan_recon = decoded_orig.permute(0, 1, 3, 4, 2).contiguous()
 
@@ -1374,7 +1412,8 @@ class Trainer(object):
             collected += take
 
         if collected == 0:
-            print(f"[step {self.step}] sample_and_visualize: no samples collected, aborting")
+            print(
+                f"[step {self.step}] sample_and_visualize: no samples collected, aborting")
             return
 
         ct_np = np.concatenate(ct_np_chunks, axis=0)
@@ -1383,7 +1422,6 @@ class Trainer(object):
         vqgan_recon_np = np.concatenate(vqgan_recon_np_chunks, axis=0)
 
         n_samples = collected  # actual count, may be < requested if val_dl ran out
-
 
         debug_folder = self.results_folder / 'debug_masks'
         debug_folder.mkdir(exist_ok=True)
@@ -1401,15 +1439,17 @@ class Trainer(object):
             orig_3d = orig_ct_np[b, 0]
             tumor_mask_3d = (mask_np[b, 0] == 2).astype(np.uint8)
 
-            synth_feats = self.radiomics_evaluator.compute_radiomics(ct_3d, tumor_mask_3d)
-            real_feats = self.radiomics_evaluator.compute_radiomics(orig_3d, tumor_mask_3d)
+            synth_feats = self.radiomics_evaluator.compute_radiomics(
+                ct_3d, tumor_mask_3d)
+            real_feats = self.radiomics_evaluator.compute_radiomics(
+                orig_3d, tumor_mask_3d)
 
             if synth_feats and real_feats:
                 synth_feats_list.append(synth_feats)
                 real_feats_list.append(real_feats)
             else:
                 print(f"[step {self.step}] radiomics skipped for sample b={b} "
-                    f"(empty tumor mask or extraction failure)")
+                      f"(empty tumor mask or extraction failure)")
 
         if len(synth_feats_list) >= 2:
             common_keys = set(synth_feats_list[0].keys())
@@ -1432,18 +1472,21 @@ class Trainer(object):
                 r, p = pearsonr(synth_vals, real_vals)
                 if np.isfinite(r):
                     correlations[key] = r
-                    self.writer.add_scalar(f'Radiomics_corr/{key}', r, self.step)
+                    self.writer.add_scalar(
+                        f'Radiomics_corr/{key}', r, self.step)
 
             if correlations:
                 mean_r = float(np.mean(list(correlations.values())))
-                self.writer.add_scalar('Radiomics_corr/mean', mean_r, self.step)
+                self.writer.add_scalar(
+                    'Radiomics_corr/mean', mean_r, self.step)
                 print(f"[step {self.step}] radiomics: {len(correlations)} features, "
-                    f"mean pearson r={mean_r:.4f} (n={len(synth_feats_list)} samples)")
+                      f"mean pearson r={mean_r:.4f} (n={len(synth_feats_list)} samples)")
             else:
-                print(f"[step {self.step}] radiomics: no valid feature correlations computed")
+                print(
+                    f"[step {self.step}] radiomics: no valid feature correlations computed")
         else:
             print(f"[step {self.step}] radiomics comparison skipped: "
-                f"fewer than 2 valid samples ({len(synth_feats_list)})")
+                  f"fewer than 2 valid samples ({len(synth_feats_list)})")
 
         for b in range(n_samples):
             ct_3d = ct_np[b, 0]
@@ -1462,9 +1505,38 @@ class Trainer(object):
             # nib.save(nib.Nifti1Image(vqgan_3d.astype(np.float32), affine), str(
             #     debug_folder / f"{stem}_vqgan_recon_ct.nii.gz"))
 
-        print(f"--- Inference complete ({n_samples} samples), resuming training ---\n")
+        print(
+            f"--- Inference complete ({n_samples} samples), resuming training ---\n")
 
-                
+    def get_tumor_weight(self, schedule='linear'):
+        """
+        Compute the tumor_weight to use at a given training step during fine-tuning.
+
+        Args:
+            step: current training step (0-indexed)
+            warmup_steps: number of steps over which to ramp from start_weight to end_weight
+            start_weight: tumor_weight at step 0 (usually 1.0, i.e. unweighted)
+            end_weight: target tumor_weight once ramping is complete
+            schedule: 'linear' or 'cosine'
+
+        Returns:
+            float tumor_weight for this step
+        """
+        if self.step >= self.warmup_steps:
+            return self.end_weight
+
+        # avoid div-by-zero if warmup_steps=0
+        progress = self.step / max(self.warmup_steps, 1)
+
+        if schedule == 'linear':
+            return self.start_weight + (self.end_weight - self.start_weight) * progress
+        elif schedule == 'cosine':
+            import math
+            # smooth start/end, slower change at the very beginning and end
+            cosine_progress = 0.5 * (1 - math.cos(math.pi * progress))
+            return self.start_weight + (self.end_weight - self.start_weight) * cosine_progress
+        else:
+            raise ValueError(f"Unknown schedule: {schedule}")
 
     def train(
         self,
@@ -1479,6 +1551,10 @@ class Trainer(object):
 
         while self.step < self.train_num_steps:
             skip_step = False
+
+            if(self.spatial_weight_loss):
+                spatial_weight = self.get_tumor_weight()
+                self.model.tumor_weight = spatial_weight
 
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl)
@@ -1584,7 +1660,7 @@ class Trainer(object):
                 self.evaluate()
 
             if self.step % 4000 == 0:
-                self.sample_and_visualize(cond_scale=3.0, n_samples=20)
+                self.sample_and_visualize(cond_scale=3.0, n_samples=40)
 
             log_fn(log)
             self.step += 1

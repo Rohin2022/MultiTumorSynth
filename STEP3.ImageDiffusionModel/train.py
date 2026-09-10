@@ -1,15 +1,17 @@
+from dataset.dataloader import get_loader
+import time
+from ddpm.unet import UNet
+import os
+import torch
+from omegaconf import DictConfig, OmegaConf, open_dict
+import hydra
+from ddpm import Unet3D, GaussianDiffusion, Trainer, Unet3D_CA, TUMOR_COLUMNS
 from re import I
-import sys, os
+import sys
+import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 sys.path.append(os.getcwd())
-from ddpm import Unet3D, GaussianDiffusion, Trainer, Unet3D_CA, TUMOR_COLUMNS
-import hydra
-from omegaconf import DictConfig, OmegaConf, open_dict
-import torch
-import os
-from ddpm.unet import UNet
-import time
-from dataset.dataloader import get_loader
+
 
 @hydra.main(config_path='config', config_name='base_cfg', version_base=None)
 def run(cfg: DictConfig):
@@ -22,7 +24,8 @@ def run(cfg: DictConfig):
         model = Unet3D(
             dim=cfg.model.unet_dim,
             dim_mults=cfg.model.dim_mults,
-            channels=cfg.model.diffusion_num_channels, # image (1) and tumor mask (1)
+            # image (1) and tumor mask (1)
+            channels=cfg.model.diffusion_num_channels,
             out_dim=cfg.model.out_dim,
             num_continuous_conditioners=len(TUMOR_COLUMNS),
             num_organs=9
@@ -48,9 +51,6 @@ def run(cfg: DictConfig):
     else:
         raise ValueError(f"Model {cfg.model.denoising_fn} doesn't exist")
 
-
-
-
     diffusion = GaussianDiffusion(
         model,
         vqgan_ckpt=cfg.model.vqgan_ckpt,
@@ -59,6 +59,8 @@ def run(cfg: DictConfig):
         channels=cfg.model.diffusion_num_channels,
         timesteps=cfg.model.timesteps,
         loss_type=cfg.model.loss_type,
+        spatial_weight_loss=True,
+        tumor_weight=1000.0
     ).cuda()
 
     val_dataset_cfg = OmegaConf.merge(
@@ -70,7 +72,7 @@ def run(cfg: DictConfig):
 
     val_dataloader, _, _ = get_loader(val_dataset_cfg)
 
-    #val_dataloader=None
+    # val_dataloader=None
 
     trainer = Trainer(
         diffusion,
@@ -88,11 +90,15 @@ def run(cfg: DictConfig):
         num_sample_rows=cfg.model.num_sample_rows,
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
-        max_grad_norm=2.0
+        max_grad_norm=2.0,
+        spatial_weight_loss=True,
+        start_weight=1000.0,
+        end_weight=1000.0,
+        warmup_steps=0
     )
 
     if cfg.model.load_milestone:
-        trainer.load(-1) # load the latest checkpoint
+        trainer.load(-1)  # load the latest checkpoint
 
     trainer.train()
 
