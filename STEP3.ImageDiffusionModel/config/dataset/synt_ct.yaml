@@ -1,4 +1,4 @@
-name: multi_tumor_train
+name: adaptive_spatial_loss
 image_channels: 1
 fold: 0
 
@@ -8,7 +8,7 @@ segmentations_root_path: /scratch/rpinise1/MultiTumorSynthesis/component_masks
 organ_segmentations_root_path: /projects/bodymaps/Data/mask_only/AbdomenAtlasPro/AbdomenAtlasPro/
 tumor_csv_path: cross_eval/
 tumor_datafile: all_radiomics_train.csv
-results_folder_postfix: 'tumor_diffusion_all_radiomics_500tsteps_UnetCA_128dim_weighted_loss_scratch_v20' # v11 10 steps, v10 100 steps
+results_folder_postfix: 'tumor_diffusion_all_radiomics_4tsteps_UnetCA_128dim_weighted_loss_scratch_v3' # v11 10 steps, v10 100 steps
 
 
 dist: False

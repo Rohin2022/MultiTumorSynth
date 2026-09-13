@@ -8,7 +8,7 @@ unet_dim: 128
 out_dim: 8 # vqgan embed_dim
 dim_mults: [1,2,4,8]
 results_folder: checkpoints/ddpm/
-results_folder_postfix: 'tumor_diffusion_all_radiomics_500tsteps_UnetCA_128dim_weighted_loss_scratch_v20' # v11 10 steps, v10 100 steps
+results_folder_postfix: 'tumor_diffusion_all_radiomics_4tsteps_UnetCA_128dim_weighted_loss_scratch_v3' # v11 10 steps, v10 100 steps
 load_milestone: False
 
 batch_size: 8 # 40
@@ -18,8 +18,8 @@ objective: pred_x0
 save_and_sample_every: 1000
 denoising_fn: Unet3D_CA
 train_lr: 1e-5
-timesteps: 500 # number of steps
-sampling_timesteps: 500 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
+timesteps: 4 # number of steps
+sampling_timesteps: 4 # number of sampling timesteps (using ddim for faster inference [see citation for ddim paper])
 loss_type: l1 # L1 or L2
 train_num_steps: 100000 # total training steps
 gradient_accumulate_every: 1 # gradient accumulation steps
@@ -27,3 +27,9 @@ ema_decay: 0.995 # exponential moving average decay
 amp: True # turn on mixed precision
 num_sample_rows: 1
 gpus: 0
+
+target_tumor_weight_fraction: 0.75
+max_tumor_weight: 1000
+min_tumor_weight: 1
+spatial_weight_loss: True
+adaptive_tumor_weight: True

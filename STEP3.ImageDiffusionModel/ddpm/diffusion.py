@@ -687,8 +687,6 @@ class Unet3D(nn.Module):
         # additive channel.
         if exists(tabular_cond):
             emb_mask = drop_mask.view(batch, 1)
-            print(tabular_cond.shape)
-            print(tabular_cond)
 
             tabular_cond = torch.where(
                 emb_mask.bool(),
@@ -706,7 +704,6 @@ class Unet3D(nn.Module):
             # shape and crash.
             zeros = torch.zeros(batch, self.tabular_emb_dim,
                                 device=device, dtype=t.dtype)
-            print("IT DOES NOT EXIST")
             t = torch.cat([t, zeros], dim=-1)
 
         h = []
@@ -739,6 +736,8 @@ class Unet3D(nn.Module):
         return self.final_conv(x)
 
 # gaussian diffusion trainer class
+
+
 
 
 def extract(a, t, x_shape):
@@ -775,7 +774,11 @@ class GaussianDiffusion(nn.Module):
         dynamic_thres_percentile=0.9,
         vqgan_ckpt=None,
         spatial_weight_loss=False,
-        tumor_weight=1.0
+        tumor_weight=1.0,
+        target_tumor_weight_fraction=0.5,
+        max_tumor_weight=1000,
+        min_tumor_weight=1,
+        adaptive_tumor_weight=True
     ):
         super().__init__()
         self.channels = channels
@@ -850,6 +853,11 @@ class GaussianDiffusion(nn.Module):
 
         self.spatial_weight_loss = spatial_weight_loss
         self.tumor_weight = tumor_weight
+
+        self.target_fraction = target_tumor_weight_fraction
+        self.max_weight = max_tumor_weight
+        self.min_weight = min_tumor_weight
+        self.adaptive_tumor_weight = adaptive_tumor_weight
 
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -981,9 +989,32 @@ class GaussianDiffusion(nn.Module):
                     t, x_start.shape) * noise
         )
 
+    def compute_adaptive_tumor_weight(self, tumor_mask_latent):
+        """
+        Computes the tumor loss weight that makes the tumor region contribute
+        `target_fraction` of the total weighted loss mass, given this batch's
+        actual tumor voxel fraction.
+
+        Args:
+            tumor_mask_latent: tensor, values in [0,1] (or already boolean), any shape
+            target_fraction: desired share of total loss mass from tumor voxels (0 < T < 1)
+            min_weight / max_weight: clamp to avoid blowup when p is tiny or the batch
+                has (near-)zero tumor voxels
+
+        Returns:
+            float weight w
+        """
+        with torch.no_grad():
+            p = (tumor_mask_latent > 0.5).float().mean().item()
+            p = max(p, 1e-6)  # avoid div-by-zero if a batch has ~no tumor voxels
+            T = self.target_fraction
+            w = (T / (1 - T)) * ((1 - p) / p)
+        return w
+
+
     def p_losses(self, x_start, t, cond=None, tabular_cond=None, textual_cond=None,
-                 noise=None, null_cond_prob=0.10, tumor_mask_latent=None,
-                 tumor_weight=1.0, **kwargs):
+                noise=None, null_cond_prob=0.10, tumor_mask_latent=None,
+                **kwargs):
         b, c, f, h, w, device = *x_start.shape, x_start.device
         noise = default(noise, lambda: torch.randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
@@ -997,14 +1028,29 @@ class GaussianDiffusion(nn.Module):
         x_recon = self.denoise_fn(
             x_noisy, t, cond=cond, tabular_cond=tabular_cond, null_cond_prob=null_cond_prob, **kwargs)
 
+        log_dict = {}
+
         if self.loss_type == 'l1':
             if self.spatial_weight_loss:
-                assert exists(
-                    tumor_mask_latent), "tumor_mask_latent required when spatial_weight_loss=True"
+                tumor_weight = self.tumor_weight
+                if self.adaptive_tumor_weight:
+                    tumor_weight = self.compute_adaptive_tumor_weight(tumor_mask_latent)
+                    log_dict["raw_tumor_weight"] = tumor_weight
+
+                    tumor_weight = float(min(max(tumor_weight, self.min_weight), self.max_weight))
+                    log_dict["clamped_tumor_weight"] = tumor_weight
+
+                assert exists(tumor_mask_latent), "tumor_mask_latent required when spatial_weight_loss=True"
                 elementwise_loss = (noise - x_recon).abs()
                 loss_weight = 1.0 + (tumor_weight - 1.0) * tumor_mask_latent
-                loss = (elementwise_loss * loss_weight).sum() / \
-                    loss_weight.sum()
+                loss = (elementwise_loss * loss_weight).sum() / loss_weight.sum()
+
+                with torch.no_grad():
+                    tumor_bool = (tumor_mask_latent > 0.5).expand_as(elementwise_loss)
+                    if tumor_bool.any():
+                        log_dict['tumor_loss'] = elementwise_loss[tumor_bool].mean().item()
+                    if (~tumor_bool).any():
+                        log_dict['tissue_loss'] = elementwise_loss[~tumor_bool].mean().item()
             else:
                 loss = F.l1_loss(noise, x_recon)
         elif self.loss_type == 'l2':
@@ -1012,7 +1058,9 @@ class GaussianDiffusion(nn.Module):
         else:
             raise NotImplementedError()
 
-        return loss
+        log_dict['loss'] = loss
+
+        return log_dict
 
     def forward(self, img, mask, tabular_cond, textual_cond=None, null_cond_prob=0.10, *args, **kwargs):
         tumor_mask = (mask == 2).float().detach()
@@ -1059,7 +1107,7 @@ class GaussianDiffusion(nn.Module):
 
         return self.p_losses(
             img, t, cond=cond, tabular_cond=tabular_cond,
-            tumor_mask_latent=tumor_mask_latent, tumor_weight=self.tumor_weight,
+            tumor_mask_latent=tumor_mask_latent,
             null_cond_prob=null_cond_prob, *args, **kwargs
         )
 
@@ -1106,10 +1154,6 @@ class Trainer(object):
         num_sample_rows=1,
         max_grad_norm=None,
         num_workers=20,
-        start_weight=1.0,
-        warmup_steps=1000,
-        end_weight=1.0,
-        spatial_weight_loss=False
     ):
         super().__init__()
         self.model = diffusion_model
@@ -1174,11 +1218,6 @@ class Trainer(object):
 
         self.reset_parameters()
 
-        self.start_weight = start_weight
-        self.warmup_steps = warmup_steps
-        self.end_weight = end_weight
-
-        self.spatial_weight_loss = spatial_weight_loss
 
     def _next_val_batch(self):
         if self.val_dl is None:
@@ -1272,6 +1311,8 @@ class Trainer(object):
 
         self.model.eval()
         val_losses = []
+        val_tumor_losses = []
+        val_tissue_losses = []
 
         n_batches = self.val_batches if self.val_batches is not None else len(
             self.val_dl)
@@ -1286,11 +1327,16 @@ class Trainer(object):
                 data, device=self.device)
 
             with autocast(enabled=self.amp, dtype=torch.bfloat16):
-                loss = self.model(image, mask, tabular_cond,
-                                  null_cond_prob=0.1)
+                out = self.model(image, mask, tabular_cond,
+                                null_cond_prob=0.1)
+            loss = out['loss']
 
             if torch.isfinite(loss):
                 val_losses.append(loss.item())
+                if 'tumor_loss' in out:
+                    val_tumor_losses.append(out['tumor_loss'])
+                if 'tissue_loss' in out:
+                    val_tissue_losses.append(out['tissue_loss'])
 
         self.model.train()
 
@@ -1299,10 +1345,22 @@ class Trainer(object):
 
         mean_val_loss = sum(val_losses) / len(val_losses)
         self.writer.add_scalar('Val_Loss', mean_val_loss, self.step)
-        print(
-            f"[step {self.step}] val_loss={mean_val_loss:.4f} (n={len(val_losses)})")
+        log_str = f"[step {self.step}] val_loss={mean_val_loss:.4f} (n={len(val_losses)})"
+
+        if val_tumor_losses:
+            mean_tumor_loss = sum(val_tumor_losses) / len(val_tumor_losses)
+            self.writer.add_scalar('Val_Tumor_Loss', mean_tumor_loss, self.step)
+            log_str += f" tumor_loss={mean_tumor_loss:.4f}"
+
+        if val_tissue_losses:
+            mean_tissue_loss = sum(val_tissue_losses) / len(val_tissue_losses)
+            self.writer.add_scalar('Val_Tissue_Loss', mean_tissue_loss, self.step)
+            log_str += f" tissue_loss={mean_tissue_loss:.4f}"
+
+        print(log_str)
         return mean_val_loss
 
+        
     @torch.no_grad()
     def sample_and_visualize(self, cond_scale=3.0, n_samples=50):
         """
@@ -1508,35 +1566,6 @@ class Trainer(object):
         print(
             f"--- Inference complete ({n_samples} samples), resuming training ---\n")
 
-    def get_tumor_weight(self, schedule='linear'):
-        """
-        Compute the tumor_weight to use at a given training step during fine-tuning.
-
-        Args:
-            step: current training step (0-indexed)
-            warmup_steps: number of steps over which to ramp from start_weight to end_weight
-            start_weight: tumor_weight at step 0 (usually 1.0, i.e. unweighted)
-            end_weight: target tumor_weight once ramping is complete
-            schedule: 'linear' or 'cosine'
-
-        Returns:
-            float tumor_weight for this step
-        """
-        if self.step >= self.warmup_steps:
-            return self.end_weight
-
-        # avoid div-by-zero if warmup_steps=0
-        progress = self.step / max(self.warmup_steps, 1)
-
-        if schedule == 'linear':
-            return self.start_weight + (self.end_weight - self.start_weight) * progress
-        elif schedule == 'cosine':
-            import math
-            # smooth start/end, slower change at the very beginning and end
-            cosine_progress = 0.5 * (1 - math.cos(math.pi * progress))
-            return self.start_weight + (self.end_weight - self.start_weight) * cosine_progress
-        else:
-            raise ValueError(f"Unknown schedule: {schedule}")
 
     def train(
         self,
@@ -1552,9 +1581,6 @@ class Trainer(object):
         while self.step < self.train_num_steps:
             skip_step = False
 
-            if(self.spatial_weight_loss):
-                spatial_weight = self.get_tumor_weight()
-                self.model.tumor_weight = spatial_weight
 
             for i in range(self.gradient_accumulate_every):
                 data = next(self.dl)
@@ -1573,12 +1599,8 @@ class Trainer(object):
                 sample_ids = data.get('bdmap_id', None)
 
                 with autocast(enabled=self.amp, dtype=torch.bfloat16):
-                    loss = self.model(
-                        image,
-                        mask,
-                        tabular_cond,
-                        null_cond_prob=0.1
-                    )
+                    out = self.model(image, mask, tabular_cond, null_cond_prob=0.1)
+                    loss = out['loss']
 
                 loss_val = loss.item()
 
@@ -1619,6 +1641,22 @@ class Trainer(object):
                 log_fn({'loss': loss_val, 'skipped': True})
                 continue  # this now continues the OUTER while loop --
                 # correctly skips opt.step, EMA, checkpointing, inference
+
+
+            if "tissue_loss" in out:
+                self.writer.add_scalar("Train/tissue_loss",out["tissue_loss"], self.step)
+
+            
+            if "tumor_loss" in out:
+                self.writer.add_scalar("Train/tumor_loss",out["tumor_loss"], self.step)
+
+
+            if "raw_tumor_weight" in out:
+                self.writer.add_scalar("spatially_weighted_loss/raw_tumor_weight", out["raw_tumor_weight"], self.step)
+
+            
+            if "clamped_tumor_weight" in out:
+                self.writer.add_scalar("spatially_weighted_loss/clamped_tumor_weight", out["clamped_tumor_weight"], self.step)
 
             # -- only reached if no micro-batch this step was skipped --
             log = {'loss': loss_val}
@@ -1666,6 +1704,7 @@ class Trainer(object):
             self.step += 1
 
         print('training completed')
+        
 
 
 class Tester(object):

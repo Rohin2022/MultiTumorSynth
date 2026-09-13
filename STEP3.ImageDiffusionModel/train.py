@@ -59,8 +59,11 @@ def run(cfg: DictConfig):
         channels=cfg.model.diffusion_num_channels,
         timesteps=cfg.model.timesteps,
         loss_type=cfg.model.loss_type,
-        spatial_weight_loss=True,
-        tumor_weight=1000.0
+        target_tumor_weight_fraction=cfg.model.target_tumor_weight_fraction,
+        max_tumor_weight=cfg.model.max_tumor_weight,
+        min_tumor_weight=cfg.model.min_tumor_weight,
+        spatial_weight_loss=cfg.model.spatial_weight_loss,
+        adaptive_tumor_weight=cfg.model.adaptive_tumor_weight
     ).cuda()
 
     val_dataset_cfg = OmegaConf.merge(
@@ -91,10 +94,7 @@ def run(cfg: DictConfig):
         results_folder=cfg.model.results_folder,
         num_workers=cfg.model.num_workers,
         max_grad_norm=2.0,
-        spatial_weight_loss=True,
-        start_weight=1000.0,
-        end_weight=1000.0,
-        warmup_steps=0
+        
     )
 
     if cfg.model.load_milestone:
