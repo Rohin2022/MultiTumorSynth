@@ -1160,7 +1160,7 @@ class Trainer(object):
         step_start_ema=2000,
         update_ema_every=10,
         save_and_sample_every=1000,
-        validate_every=500,
+        validate_every=4000,
         val_batches=50,
         results_folder='./results',
         num_sample_rows=1,
@@ -1521,6 +1521,8 @@ class Trainer(object):
                 print(f"[step {self.step}] radiomics skipped for sample b={b} "
                       f"(empty tumor mask or extraction failure)")
 
+        mean_r = None
+
         if len(synth_feats_list) >= 2:
             common_keys = set(synth_feats_list[0].keys())
             for d in synth_feats_list[1:] + real_feats_list:
@@ -1578,6 +1580,7 @@ class Trainer(object):
         print(
             f"--- Inference complete ({n_samples} samples), resuming training ---\n")
 
+        return mean_r
 
     def train(
         self,
@@ -1587,6 +1590,7 @@ class Trainer(object):
     ):
         assert callable(log_fn)
         best_train_loss = 0.90
+        best_mean_r = 0.3
 
         loss_history = []
 
@@ -1697,20 +1701,29 @@ class Trainer(object):
             if self.step % self.update_ema_every == 0:
                 self.step_ema()
 
+
+
+            if self.val_dl is not None and self.step % self.validate_every == 0:
+                self.evaluate()
+
+
+            mean_r = None
+            if self.step > 0 and self.step % 8000 == 0:
+                mean_r = self.sample_and_visualize(cond_scale=3.0, n_samples=100)
+
             if self.step != 0 and self.step % self.save_and_sample_every == 0:
                 milestone = self.step // self.save_and_sample_every
                 self.save(milestone)
 
                 if loss_val < best_train_loss:
                     best_train_loss = loss_val
-                    self.save('model_best')
-                    print(f'New best model found at step {self.step}')
+                    self.save('model_best_train_loss')
+                    print(f'New best train model found at step {self.step}')
 
-            if self.val_dl is not None and self.step % self.validate_every == 0:
-                self.evaluate()
-
-            if self.step % 4000 == 0:
-                self.sample_and_visualize(cond_scale=3.0, n_samples=40)
+                if exists(mean_r) and mean_r > best_mean_r:
+                    best_mean_r = mean_r
+                    self.save("model_best_val_mean_r")
+                    print(f'New best val mean_r model found at step {self.step}')
 
             log_fn(log)
             self.step += 1

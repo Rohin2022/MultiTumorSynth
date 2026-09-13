@@ -64,7 +64,7 @@ def run(cfg: DictConfig):
         min_tumor_weight=cfg.model.min_tumor_weight,
         spatial_weight_loss=cfg.model.spatial_weight_loss,
         adaptive_tumor_weight=cfg.model.adaptive_tumor_weight,
-        dilation_radius=2.0
+        dilation_radius=cfg.model.dilation_radius
     ).cuda()
 
     val_dataset_cfg = OmegaConf.merge(
@@ -85,7 +85,7 @@ def run(cfg: DictConfig):
         val_dataset=val_dataloader,
         train_batch_size=cfg.model.batch_size,
         save_and_sample_every=cfg.model.save_and_sample_every,
-        validate_every=cfg.model.get('validate_every', 1000),
+        validate_every=cfg.model.validate_every,
         train_lr=cfg.model.train_lr,
         train_num_steps=cfg.model.train_num_steps,
         gradient_accumulate_every=cfg.model.gradient_accumulate_every,
