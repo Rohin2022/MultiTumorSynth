@@ -778,7 +778,8 @@ class GaussianDiffusion(nn.Module):
         target_tumor_weight_fraction=0.5,
         max_tumor_weight=1000,
         min_tumor_weight=1,
-        adaptive_tumor_weight=True
+        adaptive_tumor_weight=True,
+        dilation_radius = 0.0
     ):
         super().__init__()
         self.channels = channels
@@ -858,6 +859,7 @@ class GaussianDiffusion(nn.Module):
         self.max_weight = max_tumor_weight
         self.min_weight = min_tumor_weight
         self.adaptive_tumor_weight = adaptive_tumor_weight
+        self.dilation_radius = dilation_radius
 
     def q_mean_variance(self, x_start, t):
         mean = extract(self.sqrt_alphas_cumprod, t, x_start.shape) * x_start
@@ -1033,6 +1035,16 @@ class GaussianDiffusion(nn.Module):
         if self.loss_type == 'l1':
             if self.spatial_weight_loss:
                 tumor_weight = self.tumor_weight
+                if(exists(tumor_mask_latent) and self.dilation_radius > 0):
+                    kernel_size = 2 * self.dilation_radius + 1
+                    padding = self.dilation_radius
+
+                    tumor_mask_latent = F.max_pool3d(
+                        tumor_mask_latent,
+                        kernel_size=kernel_size,
+                        stride=1,
+                        padding=padding
+                    )
                 if self.adaptive_tumor_weight:
                     tumor_weight = self.compute_adaptive_tumor_weight(tumor_mask_latent)
                     log_dict["raw_tumor_weight"] = tumor_weight

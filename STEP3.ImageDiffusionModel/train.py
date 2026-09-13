@@ -63,7 +63,8 @@ def run(cfg: DictConfig):
         max_tumor_weight=cfg.model.max_tumor_weight,
         min_tumor_weight=cfg.model.min_tumor_weight,
         spatial_weight_loss=cfg.model.spatial_weight_loss,
-        adaptive_tumor_weight=cfg.model.adaptive_tumor_weight
+        adaptive_tumor_weight=cfg.model.adaptive_tumor_weight,
+        dilation_radius=2.0
     ).cuda()
 
     val_dataset_cfg = OmegaConf.merge(
